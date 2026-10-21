@@ -1109,10 +1109,10 @@ async def _send_card(chat_id, poster, caption, buttons, fname,
                 return await app.send_file(chat_id, file=buf,
                                            caption=caption,
                                            buttons=buttons,
-                                           entities=entities)
+                                           formatting_entities=entities)
             return await app.send_message(chat_id, caption,
                                           buttons=buttons,
-                                          entities=entities)
+                                          formatting_entities=entities)
         except FloodWaitError as fw:
             print(f"[autodl] floodwait {fw.seconds}s before posting "
                   f"to {chat_id} — sleeping it out")
