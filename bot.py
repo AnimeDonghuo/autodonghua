@@ -77,6 +77,10 @@ async def main():
             n = await autodl.backlog_cards(None)
             if n:
                 print(f"[autodl] backlog cards created: {n}")
+            r = await autodl.refresh_all_cards()
+            if r:
+                print(f"[autodl] old cards topped up with missing "
+                      f"quality buttons: {r}")
         except Exception as exc:
             print("[autodl] backlog pass failed:", repr(exc)[:200])
     asyncio.ensure_future(_backlog_pass())

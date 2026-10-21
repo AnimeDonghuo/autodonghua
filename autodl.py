@@ -861,13 +861,14 @@ async def serve_deeplink(e, payload: str) -> bool:
     return True
 
 
-async def start_batch(fresh):
-    """Run one batch under the global lock (watcher, /checknew)."""
+async def start_batch(fresh, force=False):
+    """Run one batch under the global lock (watcher, /checknew,
+    /searchad). force=True re-downloads even archived qualities."""
     async with LOAD:
-        return await run_batch(fresh)
+        return await run_batch(fresh, force=force)
 
 
-async def run_batch(fresh):
+async def run_batch(fresh, force=False):
     """Process every fresh episode through the job queue, with a
     live progress panel DM'd to the owner."""
     groups = group_fresh(fresh)
@@ -889,7 +890,7 @@ async def run_batch(fresh):
     done = 0
     try:
         for g in groups:
-            if await process_group(g):
+            if await process_group(g, force=force):
                 done += 1
     finally:
         if reporter:
@@ -919,6 +920,14 @@ async def run_batch(fresh):
             await repair_posts()
         except Exception as exc:
             print("[autodl] post-repair pass failed:", repr(exc)[:200])
+        try:
+            n = await refresh_all_cards()
+            if n:
+                print(f"[autodl] cards topped up with new "
+                      f"qualities: {n}")
+        except Exception as exc:
+            print("[autodl] card refresh pass failed:",
+                  repr(exc)[:200])
         await store.set_config("pending_batch", None)
         JOBS.clear()
         BATCH["n"] = BATCH["total"] = 0
@@ -1032,39 +1041,49 @@ async def post_episode(group, ep, links, deeps, poster,
                 if _has_eng(q) == ch["eng"]}
         if not kept:
             continue
-        if await find_post(norm, ep, ch["id"], ch["eng"]):
-            continue  # this channel already has its card
         quals = sorted(kept, key=quality_order, reverse=True)
-        pid = secrets.token_hex(4)
-        await store.col("posts").update_one(
-            {"_id": pid},
-            {"$set": {"_id": pid, "norm": norm, "title": series,
-                      "eps": [ep], "quals": quals,
-                      "channel": ch["id"]}}, upsert=True)
-        # links live in the quality BUTTONS only — the poster stays
-        # clean; tapping a button DMs the file + its shareable link
-        store_links = ""
         cap_text, syn_off, syn_len = post_caption(
             episode_label=_episode_label([ep]),
             sub="Eng Sub" if ch["eng"] else "Indo-Sub",
             qualities=" | ".join(quals),
             network=await _network_line(ch["id"]),
-            store_links=store_links,
+            store_links="",
             synopsis=eng_syn if ch["eng"] else indo_syn,
             **base_card)
-        # URL buttons: the shareable deep link is EMBEDDED in each
-        # quality button (long-press = copy/open, tap = bot DM)
-        btn_row = [Button.url(f"🎬 {q}", deeps[q]) if deeps.get(q)
-                   else Button.inline(f"🎬 {q}",
-                                      f"qdl2:{pid}:{q}".encode())
-                   for q in quals]
-        buttons = [btn_row[i:i + 3]
-                   for i in range(0, len(btn_row), 3)]
-        if await _send_card(ch["id"], poster, cap_text, buttons,
-                            f"{norm}_Ep{ep}_poster.jpg",
-                            entities=_card_entities(cap_text, syn_off,
-                                                    syn_len)):
+        ents = _card_entities(cap_text, syn_off, syn_len)
+        doc = await find_post(norm, ep, ch["id"], ch["eng"])
+        if doc:
+            # card already there: top up NEW quality buttons (e.g.
+            # the batch restarted mid-episode and the rest of the
+            # qualities landed later — the card must grow with them)
+            if set(quals) - set(doc.get("quals") or []):
+                await _apply_card_edit(
+                    doc, ch["id"], cap_text,
+                    _card_buttons(quals, deeps, doc["_id"]),
+                    ents, quals)
+            continue
+        pid = secrets.token_hex(4)
+        await store.col("posts").update_one(
+            {"_id": pid},
+            {"$set": {"_id": pid, "norm": norm, "title": series,
+                      "eps": [ep], "quals": quals,
+                      "channel": ch["id"], "eng": ch["eng"],
+                      "section": first_item.get("section") or ""}},
+            upsert=True)
+        # links live in the quality BUTTONS only — the poster stays
+        # clean; tapping a button DMs the file + its shareable link
+        buttons = _card_buttons(quals, deeps, pid)
+        sentm = await _send_card(ch["id"], poster, cap_text, buttons,
+                                 f"{norm}_Ep{ep}_poster.jpg",
+                                 entities=ents)
+        if sentm:
             posted += 1
+            try:
+                await store.col("posts").update_one(
+                    {"_id": pid},
+                    {"$set": {"msg_id": getattr(sentm, "id", None)}})
+            except Exception:
+                pass
             print(f"[autodl] posted {series} Ep {ep} "
                   f"[{ch['tag'] or 'indo'}] to {ch['id']}")
         else:
@@ -1073,6 +1092,144 @@ async def post_episode(group, ep, links, deeps, poster,
                 f"<code>{ch['id']}</code> — the repair pass will "
                 f"retry it"))
     return posted
+
+
+def _card_buttons(quals, deeps, pid):
+    """URL buttons: the shareable deep link is EMBEDDED in each
+    quality button (long-press = copy/open, tap = bot DM)."""
+    btn_row = [Button.url(f"🎬 {q}", deeps[q]) if deeps.get(q)
+               else Button.inline(f"🎬 {q}",
+                                  f"qdl2:{pid}:{q}".encode())
+               for q in quals]
+    return [btn_row[i:i + 3] for i in range(0, len(btn_row), 3)]
+
+
+async def find_card_message(channel, series, ep):
+    """Locate a legacy card (posts doc without msg_id) by scanning
+    the channel's own messages for the poster of this episode."""
+    try:
+        label = f"‣ Episode ⌯ {_episode_label([ep])}"
+        async for m in app.iter_messages(channel, search=series,
+                                         limit=60):
+            cap = m.message or ""
+            if m.photo and cap.split("\n", 1)[0].strip() == series \
+                    and label in cap:
+                return m.id
+    except Exception as exc:
+        print("[autodl] card lookup failed:", repr(exc)[:160])
+    return None
+
+
+async def _apply_card_edit(doc, channel, cap_text, buttons, ents,
+                           quals) -> bool:
+    """Rewrite an existing card's caption+buttons in place."""
+    msg_id = doc.get("msg_id")
+    if not msg_id:
+        msg_id = await find_card_message(channel,
+                                         doc.get("title") or "",
+                                         (doc.get("eps") or [None])[0])
+        if not msg_id:
+            print("[autodl] card refresh: message not found in "
+                  f"{channel}")
+            return False
+    try:
+        await app.edit_message(channel, msg_id, text=cap_text,
+                               buttons=buttons,
+                               formatting_entities=ents)
+    except Exception as exc:
+        print(f"[autodl] card refresh edit failed in {channel}: "
+              f"{repr(exc)[:160]}")
+        return False
+    await store.col("posts").update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"quals": quals, "msg_id": msg_id}})
+    print(f"[autodl] card refreshed in {channel}: "
+          f"{doc.get('title')} eps {doc.get('eps')} -> {quals}")
+    return True
+
+
+async def refresh_all_cards(gap=4) -> int:
+    """Retro pass: every card whose episode later gained more
+    archived qualities gets its buttons/caption topped up — covers
+    restarts mid-batch and cards posted before this feature."""
+    docs = await store.find("posts", {})
+    chans = {c["id"]: c for c in await posting_channels()}
+    items = {}
+    changed = 0
+    for doc in docs:
+        try:
+            norm = doc.get("norm")
+            title = doc.get("title") or ""
+            ch = chans.get(doc.get("channel"))
+            eng = doc.get("eng")
+            if eng is None:
+                eng = bool(ch and ch["eng"])
+            for ep in doc.get("eps") or []:
+                recs = [r for r in await store.find(
+                    "downloaded",
+                    {"norm_title": norm, "episode": ep})
+                    if r.get("file_link")]
+                kept = {r["quality"]: r for r in recs
+                        if _has_eng(r["quality"]) == eng}
+                quals = sorted(kept, key=quality_order, reverse=True)
+                if not quals or not (set(quals)
+                                     - set(doc.get("quals") or [])):
+                    continue
+                ikey = (doc.get("section") or "", title, ep)
+                if ikey not in items:
+                    item = None
+                    for sec in ((doc.get("section") or "donghua"),
+                                "donghua", "anime"):
+                        item = await _search_episode(sec, title, ep)
+                        if item:
+                            break
+                    items[ikey] = item or {
+                        "title": f"{title} Eps {ep}",
+                        "type": doc.get("section") or "donghua",
+                        "genres": [], "rating": None,
+                        "description": ""}
+                item = items[ikey]
+                indo_syn = _clean_synopsis(item.get("description")
+                                           or "")
+                eng_syn = ""
+                if eng:
+                    try:
+                        meta = await build_metadata(title)
+                        eng_syn = pick_eng_synopsis(meta, indo_syn)
+                    except Exception:
+                        eng_syn = ""
+                deeps = {q: (r.get("deep_link")
+                             or await ensure_deep_link(
+                                 _key(norm, ep, q))
+                             or r["file_link"])
+                         for q, r in kept.items()}
+                base_card = dict(
+                    title=title,
+                    audio=_audio_lang(item),
+                    rating=(f"{item.get('rating')} / 10"
+                            if item.get("rating") else ""),
+                    genres=" ".join("#" + g.replace(" ", "")
+                                    for g in (item.get("genres")
+                                              or [])[:5]),
+                )
+                cap_text, syn_off, syn_len = post_caption(
+                    episode_label=_episode_label([ep]),
+                    sub="Eng Sub" if eng else "Indo-Sub",
+                    qualities=" | ".join(quals),
+                    network=await _network_line(doc["channel"]),
+                    store_links="",
+                    synopsis=eng_syn if eng else indo_syn,
+                    **base_card)
+                if await _apply_card_edit(
+                        doc, doc["channel"], cap_text,
+                        _card_buttons(quals, deeps, doc["_id"]),
+                        _card_entities(cap_text, syn_off, syn_len),
+                        quals):
+                    changed += 1
+                    await asyncio.sleep(gap)
+        except Exception as exc:
+            print("[autodl] refresh card failed:", repr(exc)[:160])
+    return changed
 
 
 def _card_entities(text: str, syn_off: int, syn_len: int):
@@ -1241,7 +1398,7 @@ async def backlog_cards(channel_id=None, gap=25):
     return made
 
 
-async def process_group(group) -> bool:
+async def process_group(group, force=False) -> bool:
     """Download every missing quality of every new episode (one by
     one), archive in the DB channel, then ONE designed poster post
     per series with quality buttons covering the episode range."""
@@ -1267,7 +1424,8 @@ async def process_group(group) -> bool:
     for item, todo, all_streams in entries:
         _, ep = parse_api_title(item.get("title", ""))
         for stream in todo:
-            if await registry_get(norm, ep, stream["quality"]):
+            if not force and await registry_get(
+                    norm, ep, stream["quality"]):
                 continue  # another batch already archived this file
             # one stalled file must never kill the whole batch or
             # hold the global lock forever

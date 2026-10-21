@@ -2,6 +2,7 @@
 AutoDL commands: /autodl, /checknew + quality-button callbacks.
 """
 import asyncio
+import re
 
 from telethon import events
 from telethon.tl.custom import Button
@@ -358,3 +359,132 @@ async def cb_quality(e):
         else:
             await e.respond("❌ File unavailable right now — "
                             "ask an admin.", parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# /searchad — force re-download & re-upload any episode, any quality
+# ---------------------------------------------------------------------- #
+SELAD = {}
+
+
+def _sad_parse(arg: str):
+    """'Name 09' / 'Name Eps 09' / 'Name eps 9' -> (Name, 9)."""
+    m = re.search(r"\s(\d{1,4})$", (arg or "").strip())
+    if not m:
+        return "", None
+    name = arg[:m.start()].strip()
+    name = re.sub(r"\s+eps?\.?$", "", name, flags=re.I).strip()
+    return name, int(m.group(1))
+
+
+def _sad_text(name, ep, streams, chosen):
+    lines = [f"🔎 <b>{escape_html(name)}</b> Ep {ep} — both APIs "
+             f"checked. Tap streams to (de)select, then ✅ Done:"]
+    for i, (sec, it, s) in enumerate(streams):
+        q = s.get("quality", "")
+        norm = autodl.normalize_key(it.get("series") or name)
+        done = (" · already archived"
+                if autodl.already_downloaded(norm, ep, q) else "")
+        mark = "✅" if i in chosen else "⬜️"
+        lines.append(f"{mark} {i + 1}. {sec} · {q}{done}")
+    return "\n".join(lines)
+
+
+def _sad_buttons(streams, chosen):
+    btns = [Button.inline(
+        f"{'✅' if i in chosen else '⬜️'} {sec[:4]} {s.get('quality', '')}",
+        f"sad:{i}".encode())
+        for i, (sec, it, s) in enumerate(streams)]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([Button.inline("✅ Done — force download", b"saddone"),
+                 Button.inline("❌ Cancel", b"sadcancel")])
+    return rows
+
+
+@app.on(events.NewMessage(pattern=r"^/searchad(?:\s+(.+))?$"))
+async def cmd_searchad(e):
+    """Admin: look up ONE episode on BOTH apis and force a fresh
+    download+upload of whatever streams you pick (registry ignored)."""
+    if not await require_staff(e):
+        return
+    arg = (e.pattern_match.group(1) or "").strip()
+    name, ep = _sad_parse(arg)
+    if not arg or not ep:
+        return await e.respond(
+            "📌 Usage: <code>/searchad Name 09</code> — series name "
+            "plus episode number. Checks the donghua AND anime API, "
+            "lists every stream; picked ones are re-downloaded and "
+            "re-uploaded even if already archived.",
+            parse_mode="html")
+    found, streams = [], []
+    for sec in ("donghua", "anime"):
+        it = await autodl._search_episode(sec, name, ep)
+        if it:
+            found.append(sec)
+            streams += [(sec, it, s) for s in it.get("streams", [])]
+    if not streams:
+        return await e.respond(
+            f"❌ Nothing found for <b>{escape_html(name)}</b> Ep {ep} "
+            "in the donghua or anime API.", parse_mode="html")
+    msg = await e.respond(_sad_text(name, ep, streams, set()),
+                          parse_mode="html",
+                          buttons=_sad_buttons(streams, set()))
+    SELAD[msg.id] = {"streams": streams, "chosen": set(),
+                     "by": e.sender_id, "name": name, "ep": ep,
+                     "found": found}
+
+
+@app.on(events.CallbackQuery(pattern=rb"sad:(\d+)"))
+async def cb_sad_toggle(e):
+    st = SELAD.get(e.message_id)
+    if not st or e.sender_id != st["by"]:
+        return await e.answer("Not your menu", alert=True)
+    i = int(e.pattern_match.group(1))
+    if i in st["chosen"]:
+        st["chosen"].discard(i)
+    else:
+        st["chosen"].add(i)
+    await e.edit(_sad_text(st["name"], st["ep"], st["streams"],
+                           st["chosen"]),
+                 parse_mode="html",
+                 buttons=_sad_buttons(st["streams"], st["chosen"]))
+
+
+@app.on(events.CallbackQuery(pattern=rb"sadcancel"))
+async def cb_sad_cancel(e):
+    SELAD.pop(e.message_id, None)
+    await e.edit("❌ Search cancelled.", parse_mode="html",
+                 buttons=None)
+
+
+@app.on(events.CallbackQuery(pattern=rb"saddone"))
+async def cb_sad_done(e):
+    st = SELAD.pop(e.message_id, None)
+    if not st or e.sender_id != st["by"]:
+        return await e.answer("Not your menu", alert=True)
+    if not st["chosen"]:
+        return await e.answer("Select at least one stream first",
+                              alert=True)
+    picked = {}
+    for i in sorted(st["chosen"]):
+        sec, it, s = st["streams"][i]
+        slot = picked.setdefault(sec, {"item": it, "todo": []})
+        slot["todo"].append(s)
+    entries = [(picked[sec]["item"], picked[sec]["todo"],
+                picked[sec]["item"].get("streams", []))
+               for sec in picked]
+    n = sum(len(t) for _, t, _ in entries)
+    await e.edit(
+        f"⏳ <b>Force queue started</b> — {n} file(s) for "
+        f"{escape_html(st['name'])} Ep {st['ep']} will be downloaded "
+        "and uploaded again even though they may already be "
+        "archived. Cards get their quality buttons topped up "
+        "automatically.\n\n📩 Live progress panel is in the owner's "
+        "DM.", parse_mode="html", buttons=None)
+
+    async def _run():
+        try:
+            await autodl.start_batch(entries, force=True)
+        except Exception as exc:
+            print("[autodl] searchad batch failed:", repr(exc)[:200])
+    asyncio.ensure_future(_run())
