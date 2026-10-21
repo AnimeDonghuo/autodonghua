@@ -1,0 +1,9 @@
+{
+  "api_id": 123456,
+  "api_hash": "your_api_hash_here",
+  "bot_token": "123456:ABC-DEF...",
+  "owner_ids": [987654321],
+  "log_channel": null,
+  "db_channel": null,
+  "mongo_uris": []
+}

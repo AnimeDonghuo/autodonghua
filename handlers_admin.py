@@ -1,0 +1,1010 @@
+"""
+Admin / owner commands.
+
+/addchannel <id|@user> <tag>     — channel the bot posts files to
+/buttonchannel <link> <name>     — buttons shown to normal users
+/forcesub <off|strict|request> [channel]
+/addmongodb <url>                — add MongoDB URI (persisted, multi-storage)
+/mongos · /delmongodb <n>
+/backup · /recover · /dbchannel <id> · /setlog <id>
+/sync                            — sync command menu into the bot
+/setimg <title> <url> · /setpaid <user_id> [paid|free]
+/addadmin <id> · /deladmin <id> · /admins
+/users · /usage · /stats · /broadcast · /setsource anilive <base>
+"""
+import asyncio
+import json
+import os
+
+from telethon import events, utils
+from telethon.tl.custom import Button
+from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import BotCommand, BotCommandScopeDefault
+
+from backup import backup_filename, backup_summary, load_backup, write_backup
+from config import BACKUP_DIR, CONFIG, save_config
+from core import (app, get_pass, is_owner, login, logout,
+                  require_staff, resolve_channel, store, wait_for)
+from parser import normalize_key
+from style import ADMIN_HOME, escape_html
+
+COMMAND_MENU = [
+    ("start", "Start the bot"),
+    ("help", "Help"),
+    ("request", "Request an anime / donghua"),
+    ("search", "Search the file store"),
+    ("addchannel", "Add a posting channel"),
+    ("buttonchannel", "Add a menu button channel"),
+    ("forcesub", "Force-subscribe settings"),
+    ("backup", "Backup the database"),
+    ("recover", "Restore from a backup file"),
+    ("addmongodb", "Add a MongoDB URI"),
+    ("sync", "Sync bot command menu"),
+    ("usage", "Storage & usage stats"),
+]
+
+
+def admin_kb():
+    return [
+        [Button.inline("➕ Add Channel", b"adm:addchannel"),
+         Button.inline("🧲 Button Channel", b"adm:buttonchannel")],
+        [Button.inline("🔒 Force Sub", b"adm:forcesub"),
+         Button.inline("💾 Backup", b"adm:backup")],
+        [Button.inline("🗄 MongoDB", b"adm:mongodb"),
+         Button.inline("🔄 Sync Cmds", b"adm:sync")],
+        [Button.inline("📊 Stats", b"adm:stats")],
+    ]
+
+
+async def _is_staff(uid: int) -> bool:
+    return is_owner(uid) or await store.is_admin(uid)
+
+
+# ---------------------------------------------------------------------- #
+# Posting channels
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/addchannel(?:\s|$)"))
+async def cmd_addchannel(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        return await e.respond(
+            "📌 <b>Usage:</b> /addchannel &lt;channel_id or @username&gt; [tag]\n\n"
+            "Example: <code>/addchannel -1001234567890 1080p</code>",
+            parse_mode="html")
+    target, tag = parts[1], " ".join(parts[2:]).strip().lower()
+    try:
+        ent = await resolve_channel(target)
+    except Exception:
+        return await e.respond(
+            "❌ Can't reach that channel.\n\n"
+            "The bot must be an admin there. If it already is, "
+            "try one of these instead of the raw id:\n"
+            "• send this command INSIDE that channel\n"
+            "• forward any message from it to me first\n"
+            "• use @username or an invite link")
+    from telethon.tl.types import Channel, Chat
+    if not isinstance(ent, (Channel, Chat)):
+        return await e.respond(
+            "❌ That id belongs to a USER, not a channel.\n"
+            "Send the CHANNEL id (the -100… one), its "
+            "@username, or an invite link.")
+    tag = tag or "indo"
+    await store.add_channel(ent.id, tag,
+                            title=getattr(ent, "title", None))
+    _spawn_backlog(ent.id)
+    await e.respond(
+        f"✅ <b>Channel Added</b>\n\n"
+        f"📢 <b>Name:</b> {escape_html(getattr(ent, 'title', '?'))}\n"
+        f"🆔 <b>ID:</b> <code>{ent.id}</code>\n"
+        f"🏷 <b>Tag:</b> {escape_html(tag)}\n\n"
+        f"Tag rules: <b>indo</b> → 360p…1080p · <b>eng</b> → "
+        f"only -eng streams. Change later: "
+        f"/settag {ent.id} &lt;tag&gt;",
+        parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/channels$"))
+async def cmd_channels(e):
+    if not await require_staff(e):
+        return
+    chans = await store.list_channels()
+    if not chans:
+        return await e.respond("📭 No posting channels yet. Use /addchannel.")
+    lines = ["📢 <b>Posting Channels</b>\n"]
+    kb = []
+    for c in chans:
+        lines.append(f"• <code>{c['_id']}</code> — {escape_html(c.get('title') or '?')} "
+                     f"🏷 <i>{escape_html(c.get('tag') or '')}</i>")
+        kb.append([Button.inline(f"🗑 Delete {c['_id']}",
+                                 b"adm:delchan:" + str(c["_id"]).encode())])
+    await e.respond("\n".join(lines), parse_mode="html", buttons=kb)
+
+
+@app.on(events.CallbackQuery(pattern=rb"adm:delchan:(-?\d+)"))
+async def cb_delchan(e):
+    if not await _is_staff(e.sender_id):
+        return await e.answer("⛔ Admins only", alert=True)
+    cid = int(e.pattern_match.group(1).decode())
+    await store.remove_channel(cid)
+    await e.edit(f"✅ Channel <code>{cid}</code> removed.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/buttonchannel(?:\s|$)"))
+async def cmd_buttonchannel(e):
+    if not await require_staff(e):
+        return
+    text = e.raw_text[len("/buttonchannel"):].strip()
+    if not text:
+        return await e.respond(
+            "📌 <b>Usage:</b> /buttonchannel &lt;channel link&gt; &lt;button name&gt;\n\n"
+            "Example: <code>/buttonchannel https://t.me/donghahub 🎬 Donghua Hub</code>",
+            parse_mode="html")
+    parts = text.split(None, 1)
+    url = parts[0].strip()
+    if not url.startswith("http"):
+        url = "https://t.me/" + url.lstrip("@")
+    name = parts[1].strip() if len(parts) > 1 else url
+    await store.add_button_channel(name, url)
+    await e.respond(f"✅ Button added: <b>{escape_html(name)}</b> → "
+                    f"{escape_html(url)}", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/buttonchannels$"))
+async def cmd_buttonchannels(e):
+    if not await require_staff(e):
+        return
+    bcs = await store.list_button_channels()
+    if not bcs:
+        return await e.respond("📭 No button channels yet. Use /buttonchannel.")
+    lines = ["🔘 <b>Menu Button Channels</b>\n"]
+    kb = []
+    for b in bcs:
+        lines.append(f"• <b>{escape_html(b['_id'])}</b> → {escape_html(b['url'])}")
+        kb.append([Button.inline(f"🗑 {b['_id'][:30]}",
+                                 b"adm:delbtn:" + b["_id"][:40].encode())])
+    await e.respond("\n".join(lines), parse_mode="html", buttons=kb)
+
+
+@app.on(events.CallbackQuery(pattern=rb"adm:delbtn:(.+)"))
+async def cb_delbtn(e):
+    if not await _is_staff(e.sender_id):
+        return await e.answer("⛔ Admins only", alert=True)
+    name = e.pattern_match.group(1).decode()
+    await store.remove_button_channel(name)
+    await e.edit(f"✅ Button <b>{escape_html(name)}</b> removed.", parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Force subscribe
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/forcesub(?:\s|$)"))
+async def cmd_forcesub(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    mode = parts[1].lower() if len(parts) > 1 else None
+    if mode not in ("off", "strict", "request"):
+        return await e.respond(
+            "🔒 <b>Force Subscribe</b>\n\n"
+            "<b>Modes:</b>\n"
+            "• <code>/forcesub off</code> — disabled\n"
+            "• <code>/forcesub strict &lt;channel_id&gt;</code> — user must JOIN "
+            "first, then gets files\n"
+            "• <code>/forcesub request &lt;channel_id&gt;</code> — user sends a "
+            "JOIN REQUEST, files unlock after approval\n\n"
+            "Example: <code>/forcesub strict -1001234567890</code>",
+            parse_mode="html")
+    fs = await store.get_forcesub()
+    channels = list(fs.get("channels") or [])
+    if mode != "off":
+        if len(parts) > 2:
+            try:
+                ent = await resolve_channel(parts[2])
+            except Exception:
+                return await e.respond("❌ Can't reach that channel — the bot "
+                           "must be an admin there (or send this "
+                           "command inside it once).")
+            if ent.id not in channels:
+                channels.append(ent.id)
+    await store.set_forcesub(mode, channels)
+    mode_name = {"off": "OFF 🚫",
+                 "strict": "STRICT — join first, then files ✅",
+                 "request": "JOIN REQUEST — send request, then files 📩"}[mode]
+    await e.respond(
+        f"🔒 <b>Force Sub Updated</b>\n\n"
+        f"Mode: <b>{mode_name}</b>\n"
+        f"Channels: {', '.join('<code>%d</code>' % c for c in channels) or '—'}",
+        parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# MongoDB management
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/addmongo(?:db)?(?:\s|$)"))
+async def cmd_addmongodb(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    uri = parts[1].strip() if len(parts) > 1 else ""
+    if not uri:  # maybe the URI is in the replied-to message
+        rep = await e.get_reply_message()
+        if rep and rep.text and rep.text.strip().startswith("mongodb"):
+            uri = rep.text.strip().split()[0]
+    if not uri:
+        PENDING[e.sender_id] = "addmongodb"
+        return await e.respond(
+            "📌 Send the MongoDB URI now, in one message:\n"
+            "<code>mongodb+srv://user:pass@cluster/x</code>\n\n"
+            "The URI is saved permanently — it survives restarts, and "
+            "even if storage is full you can add more URIs (auto "
+            "fail-over).", parse_mode="html")
+    if not uri.startswith("mongodb"):
+        return await e.respond("❌ That doesn't look like a MongoDB URI "
+                               "(must start with mongodb:// or mongodb+srv://).")
+    await store.add_mongo_uri(uri)
+    ok = await store._try_connect(uri)
+    if ok:
+        store.mode = "mongo"
+        await e.respond(f"✅ <b>MongoDB Connected & Saved</b>\n\n"
+                        f"<code>{escape_html(uri[:60])}</code>…\n\n"
+                        f"All data now lives in MongoDB and survives restarts.",
+                        parse_mode="html")
+    else:
+        await e.respond(f"⚠️ URI saved but connection failed — check the string:\n"
+                        f"<code>{escape_html(uri[:50])}</code>…", parse_mode="html")
+    # mirror the list into the live DB for redundancy
+    await store.set_config("mongo_uris", store.uris)
+
+
+@app.on(events.NewMessage(pattern=r"^/setowner$"))
+async def cmd_setowner(e):
+    """Claim/transfer the owner slot (panels, queue, cancels)."""
+    ids = CONFIG.get("owner_ids") or []
+    if ids and int(e.sender_id) not in [int(i) for i in ids]:
+        return await e.respond("👑 Owner only.")
+    if not ids and not await store.is_admin(e.sender_id):
+        return await e.respond("👑 An admin/owner must claim this.")
+    CONFIG["owner_ids"] = [int(e.sender_id)]
+    save_config()
+    await store.save_runtime()
+    import autodl as _ad
+    _ad.OWNER_ENT = None
+    await e.respond(f"👑 <b>Owner set</b> to <code>{e.sender_id}</code> — "
+                    f"progress panels &amp; batch reports will be "
+                    f"DM'd to you.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/mongos$"))
+async def cmd_mongos(e):
+    if not await require_staff(e):
+        return
+    if not store.uris:
+        return await e.respond("🗄 No MongoDB URIs yet. Use /addmongodb.")
+    lines = ["🗄 <b>MongoDB URIs</b>\n"]
+    for i, u in enumerate(store.uris, 1):
+        mark = " <b>(active)</b>" if u == store.active_uri else ""
+        lines.append(f"{i}. <code>{escape_html(u[:44])}</code>…{mark}")
+    lines.append(f"\nMode: <b>{store.mode.upper()}</b>")
+    await e.respond("\n".join(lines), parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/delmongodb(?:\s|$)"))
+async def cmd_delmongodb(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await e.respond("📌 Usage: /delmongodb &lt;number&gt;  (see /mongos)")
+    idx = int(parts[1]) - 1
+    if not (0 <= idx < len(store.uris)):
+        return await e.respond("❌ Invalid number.")
+    removed = store.uris.pop(idx)
+    CONFIG["mongo_uris"] = store.uris
+    save_config()
+    if store.active_uri == removed:
+        await store.init()
+    await e.respond(f"✅ Removed MongoDB #{idx + 1}:\n"
+                    f"<code>{escape_html(removed[:50])}</code>…", parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Backup & recover
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/backup$"))
+async def cmd_backup(e):
+    if not await require_staff(e):
+        return
+    m = await e.respond("💾 <b>Creating backup…</b>", parse_mode="html")
+    data = await store.backup_all()
+    path = os.path.join(BACKUP_DIR, backup_filename())
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1, default=str)
+    caption = (f"🗂 <b>AutoDonghua Backup</b>\n🕐 {data['exported_at']}\n\n"
+               + backup_summary(data))
+    db_chan = await store.get_config("db_channel")
+    sent = []
+    if db_chan:
+        try:
+            await app.send_file(db_chan, path, caption=caption, parse_mode="html")
+            sent.append("db channel")
+        except Exception as ex:
+            sent.append(f"db channel failed ({ex})")
+    try:
+        await e.respond(file=path,
+                        caption=caption + "\n\n📌 Keep this file safe — use "
+                                "/recover to restore everything from it.",
+                        parse_mode="html")
+        sent.append("your chat")
+    except Exception as ex:
+        await m.edit(f"❌ Backup created but sending failed: {ex}")
+        return
+    await store.log_backup({"at": data["exported_at"], "path": path,
+                            "collections": {k: len(v) for k, v in
+                                            data["collections"].items()}})
+    await m.delete()
+    await e.respond(f"✅ Backup saved to: <b>{', '.join(sent)}</b>", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/recover$"))
+async def cmd_recover(e):
+    if not await require_staff(e):
+        return
+    await e.respond("📥 <b>Recovery Mode</b>\n\nSend the backup JSON file now "
+                    "(forward the one from your DB channel). I'll restore "
+                    "everything — channels, images, users, files & settings.\n\n"
+                    "<i>Waiting 3 minutes…</i>", parse_mode="html")
+    msg = await wait_for(e.chat_id, timeout=180,
+                         filt=lambda m: m.document and
+                         m.document.name.endswith(".json"))
+    if not msg:
+        return await e.respond("⏱ Recovery cancelled (timeout).")
+    path = await app.download_media(msg.media)
+    try:
+        data = load_backup(path)
+    except Exception as ex:
+        return await e.respond(f"❌ Invalid backup file: {ex}")
+    counts = await store.restore_all(data)
+    summary = "\n".join(f"• {k}: <b>{v}</b>" for k, v in counts.items())
+    await e.respond(f"♻️ <b>Recovery Complete</b>\n\n{summary}\n\n"
+                    f"The bot is fully restored — even after deletion or a ban, "
+                    f"your data comes back with /recover.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/dbchannel(?:\s|$)"))
+async def cmd_dbchannel(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        cur = await store.get_config("db_channel")
+        return await e.respond(f"📌 Current DB channel: <code>{cur}</code>\n"
+                               f"Usage: /dbchannel &lt;channel_id&gt;",
+                               parse_mode="html")
+    try:
+        ent = await resolve_channel(parts[1])
+    except Exception:
+        return await e.respond("❌ Can't reach that channel — the bot "
+                           "must be an admin there (or send this "
+                           "command inside it once).")
+    from telethon.tl.types import Channel, Chat
+    if not isinstance(ent, (Channel, Chat)):
+        return await e.respond(
+            "❌ That id belongs to a USER, not a channel.\n"
+            "Send the CHANNEL id (the -100… one), its "
+            "@username, or an invite link.")
+    await store.set_config("db_channel", ent.id)
+    await e.respond(f"✅ Backups will be posted in "
+                    f"<b>{escape_html(getattr(ent, 'title', '?'))}</b> "
+                    f"(<code>{ent.id}</code>).", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/setlog(?:\s|$)"))
+async def cmd_setlog(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        cur = await store.get_config("log_channel")
+        return await e.respond(f"📌 Log channel: <code>{cur}</code>",
+                               parse_mode="html")
+    try:
+        ent = await resolve_channel(parts[1])
+    except Exception:
+        return await e.respond("❌ Can't reach that channel — the bot "
+                           "must be an admin there (or send this "
+                           "command inside it once).")
+    await store.set_config("log_channel", ent.id)
+    await e.respond(f"✅ Request logs go to <b>{escape_html(getattr(ent, 'title', '?'))}</b>.",
+                    parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Custom images
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/setimg(?:\s|$)"))
+async def cmd_setimg(e):
+    if not await require_staff(e):
+        return
+    text = e.raw_text[len("/setimg"):].strip()
+    parts = text.rsplit(None, 1)
+    if len(parts) < 2 or not parts[1].startswith("http"):
+        return await e.respond(
+            "📌 <b>Usage:</b> /setimg &lt;anime title&gt; &lt;image url&gt;\n\n"
+            "Example: <code>/setimg Soul Land https://img.jpg</code>\n\n"
+            "The image is saved by title — every future post with the same "
+            "name (any episode) automatically reuses it.", parse_mode="html")
+    title, url = parts[0].strip(), parts[1].strip()
+    await store.save_image(normalize_key(title), url=url, source="custom", custom=True)
+    await e.respond(f"🖼 Image saved for <b>{escape_html(title)}</b>.\n"
+                    f"All future posts of this title will use it automatically.",
+                    parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Users / tiers / admins
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/setpaid(?:\s|$)"))
+async def cmd_setpaid(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await e.respond("📌 Usage: /setpaid &lt;user_id&gt; [paid|free]")
+    uid = int(parts[1])
+    tier = parts[2].lower() if len(parts) > 2 else None
+    if tier not in ("paid", "free"):
+        cur = await store.get_user(uid)
+        tier = "free" if (cur or {}).get("tier") == "paid" else "paid"
+    await store.set_tier(uid, tier)
+    await e.respond(f"💎 User <code>{uid}</code> is now <b>{tier.upper()}</b>.",
+                    parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/addadmin(?:\s|$)"))
+async def cmd_addadmin(e):
+    if not await require_staff(e):
+        return
+    if not is_owner(e.sender_id):
+        return await e.respond("👑 Owner only.")
+    parts = e.raw_text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await e.respond("📌 Usage: /addadmin &lt;user_id&gt;")
+    await store.add_admin(int(parts[1]))
+    await e.respond(f"✅ <code>{parts[1]}</code> is now an admin.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/deladmin(?:\s|$)"))
+async def cmd_deladmin(e):
+    if not await require_staff(e):
+        return
+    if not is_owner(e.sender_id):
+        return await e.respond("👑 Owner only.")
+    parts = e.raw_text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await e.respond("📌 Usage: /deladmin &lt;user_id&gt;")
+    await store.remove_admin(int(parts[1]))
+    await e.respond(f"✅ Admin <code>{parts[1]}</code> removed.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/admins$"))
+async def cmd_admins(e):
+    if not await require_staff(e):
+        return
+    admins = await store.list_admins()
+    lines = [f"👑 <b>Owner:</b> "
+             f"{', '.join('<code>%d</code>' % x for x in (CONFIG.get('owner_ids') or []))}",
+             "🛡 <b>Admins:</b>"]
+    for a in admins:
+        lines.append(f"• <code>{a['_id']}</code>")
+    await e.respond("\n".join(lines), parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Stats & usage
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/users$"))
+async def cmd_users(e):
+    if not await require_staff(e):
+        return
+    users = await store.list_users(limit=10000)
+    paid = [u for u in users if u.get("tier") == "paid"]
+    out = [f"👥 <b>Users:</b> {len(users)}  (💎 paid: {len(paid)})"]
+    for u in sorted(users, key=lambda x: x.get("last_seen", ""), reverse=True)[:10]:
+        out.append(f"• <code>{u['_id']}</code> — {escape_html(u.get('first_name') or '?')} "
+                   f"@{u.get('username') or '-'} [{u.get('tier')}] "
+                   f"used: {u.get('bytes_used', 0) // 1048576} MB")
+    await e.respond("\n".join(out), parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/usage$"))
+async def cmd_usage(e):
+    if not await require_staff(e):
+        return
+    st = await store.stats()
+    files = await store.count_files()
+    out = [f"📊 <b>Storage & Usage</b>\n",
+           f"🗄 Backend: <b>{st['mode'].upper()}</b>",
+           f"💾 DB size: <b>{st.get('db_size_mb')} MB</b>"]
+    for k, v in st["collections"].items():
+        out.append(f"• {k}: {v}")
+    out.append(f"\n📁 Files posted: <b>{files}</b>")
+    await e.respond("\n".join(out), parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/stats$"))
+async def cmd_stats(e):
+    if not await require_staff(e):
+        return
+    st = await store.stats()
+    await e.respond(
+        f"📈 <b>Bot Stats</b>\n\n"
+        f"📺 Posting channels: <b>{st['collections'].get('channels', 0)}</b>\n"
+        f"🔘 Button channels: <b>{st['collections'].get('button_channels', 0)}</b>\n"
+        f"🖼 Cached images: <b>{st['collections'].get('images', 0)}</b>\n"
+        f"💾 Backups made: <b>{st['collections'].get('backups', 0)}</b>\n"
+        f"🗄 Storage: <b>{st['mode'].upper()}</b> ({st.get('db_size_mb')} MB)",
+        parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Broadcast & misc
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/broadcast(?:\s|$)"))
+async def cmd_broadcast(e):
+    if not await require_staff(e):
+        return
+    text = e.raw_text[len("/broadcast"):].strip()
+    if not text and e.is_reply:
+        r = await e.get_reply_message()
+        text = r.text or r.raw_text or ""
+    if not text:
+        return await e.respond("📌 Usage: /broadcast &lt;message&gt; "
+                               "or reply to a message.")
+    users = await store.list_users(limit=10000)
+    ok = fail = 0
+    for u in users:
+        try:
+            await app.send_message(u["_id"], text, parse_mode="html")
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await e.respond(f"📢 Broadcast done: <b>{ok}</b> sent, <b>{fail}</b> failed.",
+                    parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/setsource(?:\s|$)"))
+async def cmd_setsource(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) >= 3 and parts[1].lower() == "anilive":
+        await store.set_config("anilive_base", parts[2].strip().rstrip("/"))
+        await e.respond(f"✅ AniLive base URL set to "
+                        f"<code>{escape_html(parts[2])}</code>", parse_mode="html")
+    else:
+        cur = await store.get_config("anilive_base")
+        await e.respond(f"📌 Usage: /setsource anilive &lt;base_url&gt;\n"
+                        f"Current: <code>{cur or 'https://anilive.app'}</code>",
+                        parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/sync$"))
+async def cmd_sync(e):
+    if not await require_staff(e):
+        return
+    cmds = [BotCommand(c, d) for c, d in COMMAND_MENU]
+    await app(SetBotCommandsRequest(commands=cmds,
+                                    scope=BotCommandScopeDefault(), lang_code=""))
+    await e.respond(f"✅ <b>Commands synced!</b> {len(cmds)} commands are now "
+                    f"visible in the bot menu:\n\n" +
+                    "\n".join(f"• <code>/{c}</code> — {d}" for c, d in COMMAND_MENU),
+                    parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/help$"))
+async def cmd_help(e):
+    if await _is_staff(e.sender_id):
+        text = ("🛠 <b>Admin Commands</b>\n\n"
+                "• /addchannel &lt;id&gt; [tag] — posting channel\n"
+                "• /channels — list posting channels\n"
+                "• /buttonchannel &lt;link&gt; &lt;name&gt; — user-menu button\n"
+                "• /forcesub &lt;off|strict|request&gt; [channel]\n"
+                "• /addmongodb &lt;uri&gt; — add MongoDB (persistent)\n"
+                "• /mongos · /delmongodb &lt;n&gt;\n"
+                "• /backup · /recover · /dbchannel &lt;id&gt; · /setlog &lt;id&gt;\n"
+                "• /setimg &lt;title&gt; &lt;url&gt; — custom poster\n"
+                "• /setpaid &lt;user_id&gt; [paid|free]\n"
+                "• /addadmin · /deladmin · /admins\n"
+                "• /usage · /stats · /users · /broadcast\n"
+                "• /setsource anilive &lt;base_url&gt;\n"
+                "• /sync — refresh bot command menu")
+        return await e.respond(text, parse_mode="html")
+    from style import WELCOME_TEMPLATE
+    await e.respond(WELCOME_TEMPLATE.format(
+        username=e.sender.first_name or "Friend"), parse_mode="html")
+
+
+# ---------------------------------------------------------------------- #
+# Staff login / passgate
+# ---------------------------------------------------------------------- #
+@app.on(events.NewMessage(pattern=r"^/login(?:\s|$)"))
+async def cmd_login(e):
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        return await e.respond("🔑 <b>Staff Login</b>\n\n"
+                               "Usage: <code>/login &lt;password&gt;</code>",
+                               parse_mode="html")
+    if parts[1].strip() == await get_pass():
+        await login(e.sender_id)
+        await e.respond("✅ <b>Logged in!</b> Admin panel unlocked.\n"
+                        "Use /logout when done on a shared device.",
+                        parse_mode="html")
+    else:
+        await e.respond("❌ Wrong password.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/logout$"))
+async def cmd_logout(e):
+    await logout(e.sender_id)
+    await e.respond("👋 Logged out. Admin commands are locked again.")
+
+
+@app.on(events.NewMessage(pattern=r"^/setpass(?:\s|$)"))
+async def cmd_setpass(e):
+    if not await require_staff(e):
+        return
+    if not is_owner(e.sender_id):
+        return await e.respond("👑 <b>Owner only</b> — you must be "
+                               "logged in as the owner to change the "
+                               "password.", parse_mode="html")
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        return await e.respond("📌 Usage: /setpass &lt;new_password&gt;\n\n"
+                               "(you must be logged in — owner only)")
+    new_pass = parts[1].strip()
+    if len(new_pass) < 3:
+        return await e.respond("❌ Password too short (min 3 chars).")
+    await store.set_config("admin_pass", new_pass)
+    await e.respond(f"✅ Password changed. Old sessions stay valid until "
+                    f"/logout.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/setdbchannel(?:\s|$)"))
+async def cmd_setdbchannel(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        cur = await store.get_config("db_channel")
+        return await e.respond(
+            f"🗂 <b>TG DB Channel</b> (file archive + backups)\n\n"
+            f"Current: <code>{cur}</code>\n"
+            f"Usage: /setdbchannel &lt;channel_id&gt;\n\n"
+            f"Every posted file is archived here; users get clean "
+            f"copies (no tag) from it via /search.",
+            parse_mode="html")
+    try:
+        ent = await resolve_channel(parts[1])
+    except Exception:
+        return await e.respond(
+            "❌ Can't reach that channel.\n\n"
+            "The bot must be an admin there. If it already is, "
+            "the id has no access hash yet — send this command "
+            "INSIDE that channel once, or forward any message "
+            "from it to me, or use @username / invite link.")
+    await store.set_config("db_channel", ent.id)
+    await e.respond(f"✅ DB channel set to "
+                    f"<b>{escape_html(getattr(ent, 'title', '?'))}</b> "
+                    f"(<code>{ent.id}</code>). Files will be archived "
+                    f"here.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/setstartimg(?:\s|$)"))
+async def cmd_setstartimg(e):
+    """Banner image shown on the normal-user /start card."""
+    if not await require_staff(e):
+        return
+    arg = e.raw_text.split(maxsplit=1)[1].strip() \
+        if len(e.raw_text.split()) > 1 else ""
+    reply = await e.get_reply_message()
+    media_msg = reply if (reply is not None and
+                          (reply.photo or
+                           (reply.document and
+                            (reply.document.mime_type or "")
+                           .startswith("image/")))) else None
+    if media_msg is not None:
+        fid = utils.pack_bot_file_id(media_msg.media)
+        await store.set_config("start_image", fid)
+        return await e.respond("✅ /start banner set to the "
+                               "replied photo.", parse_mode="html")
+    if arg.lower() in ("off", "clear", "none"):
+        await store.set_config("start_image", "")
+        return await e.respond("🗑 /start banner removed — the "
+                               "card is text-only now.",
+                               parse_mode="html")
+    if arg.startswith(("http://", "https://")):
+        await store.set_config("start_image", arg)
+        return await e.respond("✅ /start banner set to that "
+                               "image URL.", parse_mode="html")
+    # no arg, no reply: wait for the next photo / url message
+    PENDING[e.sender_id] = "setstartimg"
+    await e.respond("🖼 Send the banner now — either an image "
+                    "(upload or file) or a direct image URL in one "
+                    "message.\n<code>/setstartimg off</code> removes "
+                    "it.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/adddbchannel(?:\s|$)"))
+async def cmd_adddbchannel(e):
+    """Add a TG DB channel (file archive). Multiple allowed — all
+    are saved in MongoDB and every AutoDL file is archived in all."""
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        cur = await store.list_db_channels()
+        lines = "\n".join(f"• <code>{d['_id']}</code> — "
+                          f"{escape_html(d.get('title') or '?')}"
+                          for d in cur) or "• none yet"
+        return await e.respond(
+            f"🗄 <b>DB channels:</b>\n{lines}\n\n"
+            f"Usage: /adddbchannel &lt;channel_id or @username&gt;",
+            parse_mode="html")
+    try:
+        ent = await resolve_channel(parts[1])
+    except Exception:
+        return await e.respond(
+            "❌ Can't reach that channel.\n\n"
+            "The bot must be an admin there. If it already is, "
+            "the id has no access hash yet — send this command "
+            "INSIDE that channel once, or forward any message "
+            "from it to me, or use @username / invite link.")
+    from telethon.tl.types import Channel, Chat
+    if not isinstance(ent, (Channel, Chat)):
+        return await e.respond(
+            "❌ That id belongs to a USER, not a channel.\n"
+            "Send the CHANNEL id (the -100… one), its "
+            "@username, or an invite link.")
+    await store.add_db_channel(ent.id,
+                               title=getattr(ent, "title", None))
+    await store.set_config("db_channel", ent.id)  # legacy primary
+    n = len(await store.list_db_channels())
+    await e.respond(
+        f"✅ <b>DB channel added</b>\n\n"
+        f"📢 {escape_html(getattr(ent, 'title', '?'))} "
+        f"(<code>{ent.id}</code>)\n"
+        f"🗄 Total DB channels: <b>{n}</b> — every downloaded "
+        f"file is archived in all of them.",
+        parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/dbchannels$"))
+async def cmd_dbchannels(e):
+    if not await require_staff(e):
+        return
+    cur = await store.list_db_channels()
+    if not cur:
+        return await e.respond("🗄 No DB channels yet — add one "
+                               "with /adddbchannel <id>.")
+    lines = "\n".join(f"• <code>{d['_id']}</code> — "
+                      f"{escape_html(d.get('title') or '?')}"
+                      for d in cur)
+    await e.respond(f"🗄 <b>DB channels ({len(cur)}):</b>\n{lines}\n\n"
+                    f"Remove: /deldbchannel &lt;id&gt;",
+                    parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/deldbchannel(?:\s|$)"))
+async def cmd_deldbchannel(e):
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 2:
+        return await e.respond("📌 Usage: /deldbchannel "
+                               "&lt;channel_id&gt;")
+    try:
+        cid = int(parts[1])
+    except ValueError:
+        return await e.respond("📌 That is not a channel id.")
+    await store.remove_db_channel(cid)
+    await e.respond(f"🗑 DB channel <code>{cid}</code> removed.",
+                    parse_mode="html")
+
+
+def _spawn_backlog(cid):
+    """Background: create missing cards for already-archived files
+    of this channel's flavour, paced to avoid floodwait."""
+    import autodl as _ad
+    asyncio.ensure_future(_ad.backlog_cards(cid))
+
+
+@app.on(events.NewMessage(pattern=r"^/settag(?:\s|$)"))
+async def cmd_settag(e):
+    """Change a posting channel's tag (indo / eng / eng sub)."""
+    if not await require_staff(e):
+        return
+    parts = e.raw_text.split()
+    if len(parts) < 3:
+        chans = await store.list_channels()
+        lines = "\n".join(f"• <code>{c['_id']}</code> — tag: "
+                          f"<b>{escape_html(c.get('tag') or 'indo')}</b>"
+                          for c in chans) or "• no channels yet"
+        return await e.respond(
+            f"🏷 <b>Channel tags</b>\n{lines}\n\n"
+            f"Usage: /settag &lt;channel_id&gt; &lt;tag&gt;\n"
+            f"• <b>indo</b> → base qualities 360p…1080p\n"
+            f"• <b>eng</b> / <b>eng sub</b> → only -eng streams",
+            parse_mode="html")
+    from core import norm_channel_id
+    cid = norm_channel_id(parts[1])
+    if cid is None:
+        return await e.respond("📌 That is not a channel id.")
+    tag = " ".join(parts[2:]).strip().lower()
+    await store.set_channel_tag(cid, tag)
+    _spawn_backlog(cid)
+    await e.respond(
+        f"🏷 Tag for <code>{cid}</code> → <b>{escape_html(tag)}</b>\n"
+        + ("Only -eng streams will be posted there (already "
+           "archived ones get their cards one by one)."
+           if "eng" in tag else
+           "Base qualities 360p…1080p will be posted there (already "
+           "archived ones get their cards one by one)."),
+        parse_mode="html")
+
+
+# Admin panel entry (button callbacks)
+@app.on(events.CallbackQuery(pattern=rb"adm:(addchannel|buttonchannel|forcesub|backup|mongodb|sync|stats|panel)"))
+async def cb_admin_panel(e):
+    if not await require_staff(e):
+        return
+    hint = {
+        "addchannel": "Send: /addchannel <channel_id> [tag]",
+        "buttonchannel": "Send: /buttonchannel <link> <name>",
+        "forcesub": "Send: /forcesub strict|request|off [channel_id]",
+        "backup": "Send: /backup",
+        "mongodb": "Send: /addmongodb <uri>",
+        "sync": "Send: /sync",
+        "stats": "Send: /stats or /usage",
+        "panel": "Admin commands: /addchannel /buttonchannel /forcesub "
+                 "/backup /recover /addmongodb /sync /usage /broadcast",
+    }[e.pattern_match.group(1).decode()]
+    await e.answer(hint, alert=True)
+
+
+# Generic command-button callback (from the staff /start grid):
+# buttons EXECUTE the command instead of just showing its usage.
+class _Shim:
+    """Wrap a callback (or any event) so command handlers see a
+    NewMessage-like event with a synthetic raw_text."""
+
+    def __init__(self, e, text: str, media=None):
+        self._e = e
+        self.raw_text = text
+        self._media = media
+
+    @property
+    def sender_id(self):
+        return self._e.sender_id
+
+    @property
+    def chat_id(self):
+        return self._e.chat_id
+
+    @property
+    def sender(self):
+        return self._e.sender
+
+    async def respond(self, *a, **k):
+        return await self._e.respond(*a, **k)
+
+    async def reply(self, *a, **k):
+        return await self._e.reply(*a, **k)
+
+    async def get_reply_message(self):
+        return self._media
+
+    def __getattr__(self, name):
+        return getattr(self._e, name)
+
+
+PENDING = {}  # user_id -> command waiting for its arguments
+
+NO_ARGS = {"channels", "users", "usage", "stats", "backup",
+           "dbchannels", "sync", "autodl", "checknew", "logout",
+           "admins", "mongos", "setstartimg"}
+
+CMD_FUNCS = {
+    "addchannel": cmd_addchannel,
+    "channels": cmd_channels,
+    "buttonchannel": cmd_buttonchannel,
+    "forcesub": cmd_forcesub,
+    "backup": cmd_backup,
+    "recover": cmd_recover,
+    "dbchannel": cmd_dbchannel,
+    "setlog": cmd_setlog,
+    "setimg": cmd_setimg,
+    "setpaid": cmd_setpaid,
+    "users": cmd_users,
+    "usage": cmd_usage,
+    "stats": cmd_stats,
+    "broadcast": cmd_broadcast,
+    "sync": cmd_sync,
+    "setdbchannel": cmd_setdbchannel,
+    "adddbchannel": cmd_adddbchannel,
+    "dbchannels": cmd_dbchannels,
+    "deldbchannel": cmd_deldbchannel,
+    "settag": cmd_settag,
+    "setstartimg": cmd_setstartimg,
+    "logout": cmd_logout,
+}
+
+from handlers_autodl import cmd_autodl, cmd_checknew  # noqa: E402
+CMD_FUNCS["autodl"] = cmd_autodl
+CMD_FUNCS["addmongodb"] = cmd_addmongodb
+CMD_FUNCS["checknew"] = cmd_checknew
+
+
+@app.on(events.NewMessage())
+async def pending_args(e):
+    """The arguments message after a staff-grid button tap."""
+    cmd = PENDING.pop(e.sender_id, None)
+    if not cmd:
+        return
+    text = (e.raw_text or "").strip()
+    if not text:
+        if cmd == "setstartimg" and (
+                e.photo or (e.document and
+                            (e.document.mime_type or "")
+                            .startswith("image/"))):
+            fn = CMD_FUNCS.get(cmd)
+            if fn is not None:
+                await fn(_Shim(e, f"/{cmd}", media=e))
+                raise events.StopPropagation
+        return
+    if text.startswith("/"):
+        return  # a full command — let its own handler run
+    fn = CMD_FUNCS.get(cmd)
+    if fn is None:
+        return
+    await fn(_Shim(e, f"/{cmd} {text}"))
+    raise events.StopPropagation
+
+
+@app.on(events.CallbackQuery(pattern=rb"cmd:(\d+)"))
+async def cb_cmd(e):
+    if not await require_staff(e):
+        return
+    from handlers_user import STAFF_CMDS
+    idx = int(e.pattern_match.group(1).decode())
+    if not (0 <= idx < len(STAFF_CMDS)):
+        return
+    hint = STAFF_CMDS[idx][1]
+    parts = hint.split()
+    cmd = parts[1].lstrip("/") if len(parts) > 1 else ""
+    fn = CMD_FUNCS.get(cmd)
+    if fn is None:
+        return await e.answer(hint, alert=True)
+    if cmd in NO_ARGS:
+        await e.answer(f"▶ /{cmd} …")
+        await fn(_Shim(e, f"/{cmd}"))
+    else:
+        PENDING[e.sender_id] = cmd
+        await e.answer(f"⌨ /{cmd} — send the arguments")
+        await e.respond(
+            f"⌨ <b>/{cmd}</b> — send the arguments now in one "
+            f"message.\nExample: <code>{escape_html(hint)}</code>",
+            parse_mode="html")
+
+
+# Normal-user quick buttons
+@app.on(events.CallbackQuery(pattern=rb"usr:(request|search)"))
+async def cb_usr_action(e):
+    what = e.pattern_match.group(1).decode()
+    if what == "request":
+        await e.answer("Send: /request <anime name> [episode]",
+                       alert=True)
+    else:
+        await e.answer("Send: /search <anime name>", alert=True)

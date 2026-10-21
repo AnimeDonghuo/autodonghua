@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+config.json
+downloads/
+thumbs/
+backups/
+data/
+*.log
+venv/
+.venv/
