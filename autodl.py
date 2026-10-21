@@ -703,6 +703,7 @@ async def run_job(group, item, ep, stream, db_ids, poster):
     series = group["series"]
     norm = group["norm"]
     q = stream["quality"]
+    from telethon.errors import FloodWaitError
     job = _new_job(series, ep, q, stream["url"])
     CURRENT = job
     BATCH["n"] += 1
@@ -717,7 +718,7 @@ async def run_job(group, item, ep, stream, db_ids, poster):
             job["status"] = "failed"
             job["error"] = "disk low"
             print("[autodl] disk low — skipping", fname)
-            return
+            return job
         await download_stream(stream["url"], path, job)
         size = os.path.getsize(path)
         job["phase"] = "upload"
@@ -728,24 +729,37 @@ async def run_job(group, item, ep, stream, db_ids, poster):
 
         refs = []
         for dbc in db_ids:  # archive in every DB channel
-            try:
-                sent = await app.send_file(
-                    dbc, file=path,
-                    caption=f"{series} — Ep {ep} [{q}] "
-                            f"{human_size(size)}",
-                    thumb=poster, supports_streaming=True,
-                    force_document=True, progress_callback=up_cb)
-                refs.append({"channel": int(dbc),
-                             "msg_id": sent.id,
-                             "link": await file_link(dbc, sent.id),
-                             "doc": _doc_ref(sent.document
-                                             or sent.video)})
-            except Exception as exc:
-                print(f"[autodl] archive failed to {dbc}: {exc}")
+            sent = None
+            for attempt in (1, 2, 3):  # transient upload errors retry
+                try:
+                    sent = await app.send_file(
+                        dbc, file=path,
+                        caption=f"{series} — Ep {ep} [{q}] "
+                                f"{human_size(size)}",
+                        thumb=poster, supports_streaming=True,
+                        force_document=True, progress_callback=up_cb)
+                    break
+                except FloodWaitError as fw:
+                    print(f"[autodl] archive floodwait {fw.seconds}s "
+                          f"to {dbc} — sleeping it out")
+                    await asyncio.sleep(fw.seconds + 5)
+                except Exception as exc:
+                    print(f"[autodl] archive try {attempt} failed to "
+                          f"{dbc}: {exc}")
+                    await asyncio.sleep(8)
+            if sent is None:
+                print(f"[autodl] archive FAILED to {dbc} after 3 tries")
+                continue
+            refs.append({"channel": int(dbc),
+                         "msg_id": sent.id,
+                         "link": await file_link(dbc, sent.id),
+                         "doc": _doc_ref(sent.document
+                                         or sent.video)})
         if not refs:
             job["status"] = "failed"
-            job["error"] = "archive failed"
-            return
+            job["error"] = (f"archive failed to all {len(db_ids)} "
+                            f"DB channel(s)")
+            return job
         link = refs[0]["link"]
         primary, extra = refs[0], refs[1:]
         await mark_downloaded(item["id"], norm, series, ep, q,
@@ -768,6 +782,7 @@ async def run_job(group, item, ep, stream, db_ids, poster):
         except Exception:
             pass
         CURRENT = None
+    return job
 
 
 async def serve_deeplink(e, payload: str) -> bool:
@@ -1010,24 +1025,52 @@ async def post_episode(group, ep, links, deeps, poster,
             posted += 1
             print(f"[autodl] posted {series} Ep {ep} "
                   f"[{ch['tag'] or 'indo'}] to {ch['id']}")
+        else:
+            asyncio.ensure_future(_owner_dm(
+                f"❌ <b>Card post failed</b> — {series} Ep {ep} to "
+                f"<code>{ch['id']}</code> — the repair pass will "
+                f"retry it"))
     return posted
 
 
 def _card_entities(text: str, syn_off: int, syn_len: int):
     """Whole-card bold + collapsed (expandable) synopsis quote —
-    built by hand so no parser/layer can ever drop them."""
+    built by hand so no parser/layer can ever drop them. The bold
+    never WRAPS the quote (three spans: before / inside / after)
+    because clients mis-render a blockquote nested inside bold —
+    that is what kept the quote arriving expanded."""
     from telethon.tl.types import (MessageEntityBold,
                                    MessageEntityBlockquote)
     total = len(text.encode("utf-16-le")) // 2
-    ents = [MessageEntityBold(offset=0, length=total)]
-    if syn_len > 0:
-        try:
-            ents.append(MessageEntityBlockquote(
-                offset=syn_off, length=syn_len, collapsed=True))
-        except TypeError:  # ancient telethon without the flag
-            ents.append(MessageEntityBlockquote(
-                offset=syn_off, length=syn_len))
+    if syn_len <= 0:
+        return [MessageEntityBold(offset=0, length=total)]
+    ents = []
+    if syn_off > 0:
+        ents.append(MessageEntityBold(offset=0, length=syn_off))
+    ents.append(MessageEntityBold(offset=syn_off, length=syn_len))
+    try:
+        ents.append(MessageEntityBlockquote(
+            offset=syn_off, length=syn_len, collapsed=True))
+    except TypeError:  # ancient telethon without the flag
+        print("[autodl] WARNING: this telethon has no collapsed "
+              "blockquote flag — upgrade to telethon>=1.45")
+        ents.append(MessageEntityBlockquote(
+            offset=syn_off, length=syn_len))
+    if total > syn_off + syn_len:
+        ents.append(MessageEntityBold(
+            offset=syn_off + syn_len, length=total - syn_off - syn_len))
     return ents
+
+
+def telethon_info() -> str:
+    """Version line for /status — proves what the deploy runs and
+    whether its TL layer even knows collapsed quotes."""
+    import telethon
+    import inspect
+    from telethon.tl.types import MessageEntityBlockquote as bq
+    ok = "collapsed" in inspect.signature(bq.__init__).parameters
+    return (f"🧩 Telethon {telethon.__version__} · "
+            f"collapsed-quote: {'yes' if ok else 'NO (upgrade!)'}")
 
 
 async def _send_card(chat_id, poster, caption, buttons, fname,
@@ -1148,16 +1191,23 @@ async def process_group(group) -> bool:
             err = None
             for attempt in (1, 2):  # one retry before giving up
                 err = None
+                job = None
                 try:
-                    await asyncio.wait_for(
+                    job = await asyncio.wait_for(
                         run_job(group, item, ep, stream, db_ids,
                                 poster),
                         timeout=5400)
-                    break
                 except asyncio.TimeoutError:
                     err = "timeout (90 min)"
                 except Exception as exc:
                     err = repr(exc)[:160]
+                # a job can also fail QUIETLY (disk low / archive
+                # error inside run_job) — never let that stay silent
+                if err is None and job is not None \
+                        and job.get("status") == "failed":
+                    err = job.get("error") or "failed"
+                if err is None:
+                    break
                 print(f"[autodl] job attempt {attempt} failed "
                       f"({err}): {series} Ep {ep} "
                       f"{stream['quality']}")
@@ -1166,6 +1216,8 @@ async def process_group(group) -> bool:
                     CURRENT["error"] = err or "failed"
                 CURRENT = None
                 _free_up(900)
+                if err == "disk low" or err.startswith("archive"):
+                    break  # re-downloading cannot fix disk/channel
                 await asyncio.sleep(3)
             if err:  # never silent: tell the owner
                 print("[autodl] job FAILED:", series, "Ep", ep,
@@ -1191,8 +1243,130 @@ async def process_group(group) -> bool:
             TOUCHED.add((norm, ep))
             posted_any |= bool(
                 await post_episode(group, ep, links, deeps, poster))
+        # indo archived but the API offers no eng streams yet?
+        # remember (series, ep) — the eng watcher polls the search
+        # API and grabs it the moment the eng sub lands
+        if links and not any(_has_eng(s.get("quality", ""))
+                             for s in item.get("streams", [])):
+            await pending_eng_add(item.get("section") or "donghua",
+                                  series, norm, ep)
 
     return posted_any or bool(eps_links)
+
+
+# ---------------------------------------------------------------------- #
+# Late eng subs — remembered until the API grows them
+# ---------------------------------------------------------------------- #
+def _pending_id(section, norm, ep) -> str:
+    return f"{section}|{norm}|{ep}"
+
+
+async def pending_eng_add(section, series, norm, ep) -> None:
+    """Indo archived but the API has no eng streams yet: remember
+    (series, ep) so the eng watcher retries via the search API."""
+    try:
+        await store.col("eng_pending").update_one(
+            {"_id": _pending_id(section, norm, ep)},
+            {"$set": {"section": section, "series": series,
+                      "norm": norm, "ep": ep, "status": "pending"},
+             "$setOnInsert": {"created": time.time()}},
+            upsert=True)
+    except Exception as exc:
+        print("[autodl] pending-eng save failed:", exc)
+
+
+async def _registry_has_eng(norm, ep) -> bool:
+    """Any eng flavour of this episode already archived?"""
+    for r in await store.find("downloaded",
+                              {"norm_title": norm, "episode": ep}):
+        if _has_eng(r.get("quality", "")) or _has_eng(r.get("_id", "")):
+            return True
+    return False
+
+
+async def _search_episode(section: str, series: str, ep):
+    """Direct episode lookup on the search API: donghua wants
+    '<series> Eps NN', anime just the series name."""
+    from urllib.parse import quote
+    q = series if section == "anime" else f"{series} Eps {int(ep):02d}"
+    for item in await _fetch_one(
+            f"{API_ROOT}/{section}/search?q={quote(q)}"):
+        s, e2 = parse_api_title(item.get("title", ""))
+        if e2 == ep and normalize_key(s) == normalize_key(series):
+            item.setdefault("section", section)
+            return item
+    return None
+
+
+async def _eng_pending_pass(st) -> int:
+    """One sweep: close what already landed, fetch what just did."""
+    col = store.col("eng_pending")
+    for doc in await store.find("eng_pending", {"status": "pending"}):
+        if await _registry_has_eng(doc["norm"], doc["ep"]):
+            await col.update_one({"_id": doc["_id"]},
+                                 {"$set": {"status": "done",
+                                           "done_ts": time.time()}})
+    docs = await store.find("eng_pending", {"status": "pending"})
+    docs.sort(key=lambda d: d.get("created", 0))
+    done = 0
+    for doc in docs[:10]:  # gentle per-tick cap
+        section = doc.get("section") or "donghua"
+        series, ep, norm = doc["series"], doc["ep"], doc["norm"]
+        try:
+            item = await _search_episode(section, series, ep)
+        except Exception as exc:
+            print("[autodl] eng search failed:", repr(exc)[:160])
+            item = None
+        await col.update_one({"_id": doc["_id"]},
+                             {"$set": {"checked": time.time()},
+                              "$inc": {"tries": 1}})
+        if not item:
+            continue
+        wanted = wanted_streams(item.get("streams", []),
+                                st["qualities"], False, True)
+        missing = [s for s in wanted
+                   if not already_downloaded(norm, ep,
+                                             s.get("quality", ""))]
+        if not missing:
+            if wanted or await _registry_has_eng(norm, ep):
+                await col.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"status": "done",
+                              "done_ts": time.time()}})
+            continue
+        quals = ", ".join(s.get("quality", "") for s in missing)
+        print(f"[autodl] eng sub arrived: {series} Ep {ep} — "
+              f"{quals} — queueing")
+        await _owner_dm(f"🇬 <b>Eng sub arrived</b> — {series} Ep {ep}"
+                        f" [{quals}] — downloading & uploading now")
+        allw = wanted_streams(item.get("streams", []),
+                              st["qualities"], True, True)
+        await start_batch([(item, missing, allw)])
+        if await _registry_has_eng(norm, ep):
+            await col.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"status": "done", "done_ts": time.time()}})
+            done += 1
+        await asyncio.sleep(10)
+    return done
+
+
+async def eng_pending_loop():
+    """Every 15 min: ask the search API for every remembered episode
+    whose eng sub was still missing when indo went out. Uploaded
+    ones are marked done (and stay saved, so nothing repeats)."""
+    await asyncio.sleep(40)
+    while True:
+        try:
+            st = await get_settings()
+            if not LOAD.locked():
+                n = await _eng_pending_pass(st)
+                if n:
+                    print(f"[autodl] eng-pending pass finished "
+                          f"{n} episode(s)")
+        except Exception as exc:
+            print("[autodl] eng-pending loop error:", exc)
+        await asyncio.sleep(15 * 60)
 
 
 async def autodl_loop():
