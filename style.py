@@ -96,18 +96,21 @@ def post_caption(*, title: str, episode_label: str, audio: str,
         rows.append(f"‣ Genres ⌯ {genres}")
     head = [title or "", "⟣────────────────────⟢"]
     head += rows
-    head += ["⟣────────────────────⟢", "‣ Synopsis ⌯"]
+    head += ["⟣────────────────────⟢"]
     tail = []
     if network:
         tail.append(network)
     if store_links:
         tail.append(store_links)
-    shell = "\n".join(head + ["{SYN}"] + tail)
+    syn = (synopsis or "").strip()
+    if not syn:  # no synopsis: no dangling "Synopsis" header either
+        return "\n".join(head + tail), 0, 0
+    head_syn = head + ["‣ Synopsis ⌯"]
+    shell = "\n".join(head_syn + ["{SYN}"] + tail)
     used = _u16(shell) - _u16("{SYN}")
     max_syn = max(60, budget - used)
-    syn = (synopsis or "").strip()
     if len(syn) > max_syn:
         syn = syn[:max_syn].rsplit(" ", 1)[0].rstrip() + "…"
     text = shell.replace("{SYN}", syn, 1)
-    off = _u16("\n".join(head) + "\n")
+    off = _u16("\n".join(head_syn) + "\n")
     return text, off, _u16(syn)

@@ -255,7 +255,7 @@ async def cmd_status(e):
     head = (f"🤖 <b>AutoDL:</b> {'🟢 on' if st.get('enabled') else '🔴 off'}"
             f" · every {st.get('interval', 20)} min\n"
             f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
-            f"{autodl.telethon_info()}\n\n")
+            f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
     m = await e.respond(head + autodl.job_panel(autodl.CURRENT),
                         parse_mode="html",
                         buttons=[Button.inline("🔄 Refresh", b"jrefresh")])
@@ -271,7 +271,7 @@ async def cb_jrefresh(e):
     head = (f"🤖 <b>AutoDL:</b> {'🟢 on' if st.get('enabled') else '🔴 off'}"
             f" · every {st.get('interval', 20)} min\n"
             f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
-            f"{autodl.telethon_info()}\n\n")
+            f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
     try:
         await e.edit(head + autodl.job_panel(autodl.CURRENT),
                      parse_mode="html",

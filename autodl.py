@@ -38,6 +38,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
+BUILD = "2026-10-21-d"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
@@ -554,6 +555,27 @@ def _clean_synopsis(desc: str) -> str:
     return text
 
 
+def pick_eng_synopsis(meta, indo_syn: str) -> str:
+    """English synopsis STRICTLY from the EN sources (AniList/Jikan).
+    The Indonesian mirror scrapes (animxin/lucifer/anilive) must never
+    leak into eng cards — that was the indo/eng synopsis crossover."""
+    import re as _re
+    bs = (meta or {}).get("by_source") or {}
+    raw = ""
+    for src in ("anilist", "jikan"):
+        r = bs.get(src)
+        desc = getattr(r, "description", None) if r else None
+        if desc:
+            raw = desc
+            break
+    raw = _re.sub(r"<[^>]+>", " ", raw)
+    raw = _re.sub(r"\s+", " ", raw).strip()
+    syn = _clean_synopsis(raw)
+    if syn and indo_syn and syn.strip() == indo_syn.strip():
+        return ""  # an indo blob mislabelled as english
+    return syn
+
+
 def _audio_lang(item) -> str:
     kind = str(item.get("type") or item.get("section") or "").lower()
     return "Chinese" if kind == "donghua" else "Japanese"
@@ -982,11 +1004,8 @@ async def post_episode(group, ep, links, deeps, poster,
     indo_syn = _clean_synopsis(first_item.get("description") or "")
     eng_syn = ""
     try:
-        import re as _re
         meta = await build_metadata(series)
-        raw = _re.sub(r"<[^>]+>", " ", meta.get("description") or "")
-        raw = _re.sub(r"\s+", " ", raw).strip()
-        eng_syn = _clean_synopsis(raw)
+        eng_syn = pick_eng_synopsis(meta, indo_syn)
     except Exception:
         eng_syn = ""
     base_card = dict(
@@ -1031,7 +1050,7 @@ async def post_episode(group, ep, links, deeps, poster,
             qualities=" | ".join(quals),
             network=await _network_line(ch["id"]),
             store_links=store_links,
-            synopsis=(eng_syn or indo_syn) if ch["eng"] else indo_syn,
+            synopsis=eng_syn if ch["eng"] else indo_syn,
             **base_card)
         # URL buttons: the shareable deep link is EMBEDDED in each
         # quality button (long-press = copy/open, tap = bot DM)
@@ -1085,6 +1104,21 @@ def _card_entities(text: str, syn_off: int, syn_len: int):
     return ents
 
 
+def _ents_ok(sent, entities) -> bool:
+    """Did the sent message keep the bold + collapsed quote?"""
+    got = getattr(sent, "entities", None) or []
+    names = [(type(e).__name__, getattr(e, "collapsed", None))
+             for e in got]
+    has_bold = any(n == "MessageEntityBold" for n, _ in names)
+    want_cq = any(getattr(e, "collapsed", False) for e in entities)
+    has_cq = any(n == "MessageEntityBlockquote" and c
+                 for n, c in names)
+    return has_bold and (has_cq if want_cq else True)
+
+
+_FMT_WARNED = False
+
+
 def telethon_info() -> str:
     """Version line for /status — proves what the deploy runs and
     whether its TL layer even knows collapsed quotes."""
@@ -1099,20 +1133,46 @@ def telethon_info() -> str:
 async def _send_card(chat_id, poster, caption, buttons, fname,
                      entities=None):
     """Send one card, sleeping out any FloodWaitError so channel
-    posting never trips Telegram's rate limit."""
+    posting never trips Telegram's rate limit. Afterwards the sent
+    message is checked: if the bold/collapsed-quote entities did not
+    survive, one repair edit is tried and the owner is warned once."""
     from telethon.errors import FloodWaitError
     for _attempt in range(3):
         try:
             if poster:
                 buf = io.BytesIO(poster)
                 buf.name = fname
-                return await app.send_file(chat_id, file=buf,
+                sent = await app.send_file(chat_id, file=buf,
                                            caption=caption,
                                            buttons=buttons,
                                            formatting_entities=entities)
-            return await app.send_message(chat_id, caption,
-                                          buttons=buttons,
-                                          formatting_entities=entities)
+            else:
+                sent = await app.send_message(chat_id, caption,
+                                              buttons=buttons,
+                                              formatting_entities=entities)
+            if sent is not None and entities and \
+                    not _ents_ok(sent, entities):
+                print(f"[autodl] card entities missing on send to "
+                      f"{chat_id} — trying one repair edit")
+                try:
+                    edited = await sent.edit(caption=caption,
+                                             buttons=buttons,
+                                             formatting_entities=entities)
+                    if edited is not None:
+                        sent = edited
+                except Exception as exc:
+                    print(f"[autodl] card repair edit failed: {exc}")
+                if not _ents_ok(sent, entities):
+                    global _FMT_WARNED
+                    if not _FMT_WARNED:
+                        _FMT_WARNED = True
+                        asyncio.ensure_future(_owner_dm(
+                            "⚠️ <b>Card formatting missing</b> on a "
+                            f"channel post — build {BUILD}, "
+                            f"{telethon_info()}. Please send /status "
+                            "and share the reply so the deploy can be "
+                            "checked."))
+            return sent
         except FloodWaitError as fw:
             print(f"[autodl] floodwait {fw.seconds}s before posting "
                   f"to {chat_id} — sleeping it out")
