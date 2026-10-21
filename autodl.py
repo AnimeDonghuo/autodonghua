@@ -476,11 +476,14 @@ async def download_stream(url: str, dest: str, job=None) -> str:
                 job["total"] = total
             last = time.time()
             last_done = done
+            loop = asyncio.get_running_loop()
             with open(dest, mode) as f:
                 async for chunk in r.content.iter_chunked(1 << 20):
                     if job is not None and job["cancel"]:
                         raise JobCancelled()
-                    f.write(chunk)
+                    # disk write off the event loop: the bot keeps
+                    # answering users while multi-GB files land
+                    await loop.run_in_executor(None, f.write, chunk)
                     done += len(chunk)
                     if job is not None:
                         job["done"] = done
@@ -728,16 +731,29 @@ async def run_job(group, item, ep, stream, db_ids, poster):
             job["up_total"] = total_bytes
 
         refs = []
+        cap = (f"{series} — Ep {ep} [{q}] "
+               f"{human_size(size)}")
+        primary = None  # first DB channel gets the real upload
         for dbc in db_ids:  # archive in every DB channel
             sent = None
             for attempt in (1, 2, 3):  # transient upload errors retry
                 try:
-                    sent = await app.send_file(
-                        dbc, file=path,
-                        caption=f"{series} — Ep {ep} [{q}] "
-                                f"{human_size(size)}",
-                        thumb=poster, supports_streaming=True,
-                        force_document=True, progress_callback=up_cb)
+                    if primary is None:
+                        # explicit 512 KB parts = fewest round-trips
+                        # = fastest upload Telegram allows
+                        up = await app.upload_file(
+                            path, part_size_kb=512, file_size=size,
+                            progress_callback=up_cb)
+                        sent = await app.send_file(
+                            dbc, file=up, caption=cap,
+                            thumb=poster, supports_streaming=True,
+                            force_document=True)
+                    else:
+                        # server-side copy: reuse the media Telegram
+                        # already stores — zero re-upload, instant
+                        sent = await app.send_file(
+                            dbc, file=primary.media, caption=cap,
+                            force_document=True)
                     break
                 except FloodWaitError as fw:
                     print(f"[autodl] archive floodwait {fw.seconds}s "
@@ -750,11 +766,18 @@ async def run_job(group, item, ep, stream, db_ids, poster):
             if sent is None:
                 print(f"[autodl] archive FAILED to {dbc} after 3 tries")
                 continue
+            if primary is None:
+                primary = sent
             refs.append({"channel": int(dbc),
                          "msg_id": sent.id,
                          "link": await file_link(dbc, sent.id),
                          "doc": _doc_ref(sent.document
                                          or sent.video)})
+        if refs and len(refs) < len(db_ids):
+            asyncio.ensure_future(_owner_dm(
+                f"⚠️ <b>Archive incomplete</b> — {series} Ep {ep} "
+                f"[{q}]: reached {len(refs)}/{len(db_ids)} DB "
+                f"channel(s)"))
         if not refs:
             job["status"] = "failed"
             job["error"] = (f"archive failed to all {len(db_ids)} "
@@ -1337,7 +1360,7 @@ async def _eng_pending_pass(st) -> int:
         quals = ", ".join(s.get("quality", "") for s in missing)
         print(f"[autodl] eng sub arrived: {series} Ep {ep} — "
               f"{quals} — queueing")
-        await _owner_dm(f"🇬 <b>Eng sub arrived</b> — {series} Ep {ep}"
+        await _owner_dm(f"🌐 <b>Eng sub arrived</b> — {series} Ep {ep}"
                         f" [{quals}] — downloading & uploading now")
         allw = wanted_streams(item.get("streams", []),
                               st["qualities"], True, True)
