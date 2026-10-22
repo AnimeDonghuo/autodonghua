@@ -430,6 +430,12 @@ async def _owner_dm(text: str):
                   "(send /setowner once)" )
         return None
     oid = getattr(ent, "id", 0)
+    if not oid:  # input entities carry user_id/channel_id, not id
+        try:
+            from telethon import utils as _tu
+            oid = _tu.get_peer_id(ent)
+        except Exception:
+            oid = 0
     left = core_mod.flood_left(oid)
     if left:  # mid-flood: deliver right after the window instead
         asyncio.ensure_future(_delayed_owner_dm(oid, text, left + 5))
@@ -1190,30 +1196,46 @@ def _card_buttons(quals, deeps, pid):
     return [btn_row[i:i + 3] for i in range(0, len(btn_row), 3)]
 
 
-async def find_card_message(channel, series, ep):
-    """Locate a legacy card (posts doc without msg_id) by scanning
-    the channel's own messages for the poster of this episode."""
+async def _channel_card_map(channel, cache, limit=600):
+    """(title, episode-label) -> message id for every photo
+    card in a channel. Bots may NOT use messages.Search
+    (BotMethodInvalidError), so this is a plain history scan
+    (GetHistory IS allowed for bots), cached per pass."""
+    if channel in cache:
+        return cache[channel]
+    mp = {}
     try:
-        label = f"‣ Episode ⌯ {_episode_label([ep])}"
-        async for m in app.iter_messages(channel, search=series,
-                                         limit=60):
+        async for m in app.iter_messages(channel, limit=limit):
             cap = m.message or ""
-            if m.photo and cap.split("\n", 1)[0].strip() == series \
-                    and label in cap:
-                return m.id
+            if not m.photo or not cap:
+                continue
+            first = cap.split("\n", 1)[0].strip()
+            mm = re.search("‣ Episode ⌯ (.+)", cap)
+            if mm:
+                mp[(first, mm.group(1).strip())] = m.id
     except Exception as exc:
-        print("[autodl] card lookup failed:", repr(exc)[:160])
-    return None
+        print("[autodl] channel scan failed:", repr(exc)[:160])
+    cache[channel] = mp
+    return mp
+
+
+async def find_card_message(channel, series, ep, cache=None):
+    """Locate a legacy card (posts doc without msg_id)."""
+    mp = await _channel_card_map(channel,
+                                 cache if cache is not None
+                                 else {})
+    return mp.get((series, _episode_label([ep])))
 
 
 async def _apply_card_edit(doc, channel, cap_text, buttons, ents,
-                           quals) -> bool:
+                           quals, cache=None) -> bool:
     """Rewrite an existing card's caption+buttons in place."""
     msg_id = doc.get("msg_id")
     if not msg_id:
         msg_id = await find_card_message(channel,
                                          doc.get("title") or "",
-                                         (doc.get("eps") or [None])[0])
+                                         (doc.get("eps") or [None])[0],
+                                         cache=cache)
         if not msg_id:
             print("[autodl] card refresh: message not found in "
                   f"{channel}")
@@ -1241,6 +1263,7 @@ async def refresh_all_cards(gap=4) -> int:
     docs = await store.find("posts", {})
     chans = {c["id"]: c for c in await posting_channels()}
     items = {}
+    scan_cache = {}  # one history scan per channel per pass
     changed = 0
     for doc in docs:
         try:
@@ -1310,7 +1333,7 @@ async def refresh_all_cards(gap=4) -> int:
                         doc, doc["channel"], cap_text,
                         _card_buttons(quals, deeps, doc["_id"]),
                         _card_entities(cap_text, syn_off, syn_len),
-                        quals):
+                        quals, cache=scan_cache):
                     changed += 1
                     await asyncio.sleep(gap)
         except Exception as exc:
