@@ -9,7 +9,8 @@ from telethon.tl.custom import Button
 
 from core import (app, bot_user, forcesub_check, invite_link,
                   is_admin, is_staff, member_status, mention,
-                  store, url_bytes)
+                  store, url_bytes,
+    flood_respond, flood_edit)
 from sources import build_metadata, SOURCE_LABELS
 from style import escape_html, welcome_text
 
@@ -138,7 +139,7 @@ async def cmd_start(e):
                 media = img  # packed file_id
         except Exception:
             media = None
-    await e.respond(text, file=media, parse_mode="html",
+    await flood_respond(e, text, file=media, parse_mode="html",
                     buttons=buttons or None)
 
 
@@ -179,7 +180,7 @@ async def forcesub_gate(e, fs):
               "your files. 👇" if mode == "strict" else
               "You must <b>send a join request</b> to our channel — "
               "files unlock once approved. 👇"))
-    await e.respond(msg, buttons=buttons, parse_mode="html")
+    await flood_respond(e, msg, buttons=buttons, parse_mode="html")
 
 
 # ---------------------------------------------------------------------- #
@@ -209,14 +210,14 @@ async def cmd_request(e):
         used = user.get("requests_today", 0)
     limit = PAID_LIMIT if tier == "paid" else FREE_LIMIT
     if used >= limit:
-        return await e.respond(
+        return await flood_respond(e, 
             f"🚫 <b>Daily request limit reached</b> ({used}/{limit}).\n\n"
             f"💎 Upgrade to a <b>Paid</b> plan for {PAID_LIMIT} requests/day, "
             f"or come back tomorrow.", parse_mode="html")
 
     args = e.raw_text.split(None, 1)
     if len(args) < 2:
-        return await e.respond(
+        return await flood_respond(e, 
             "📌 <b>Usage:</b> /request &lt;anime or donghua name&gt; [episode]\n\n"
             "Example: <code>/request Shrouding the Heavens 45</code>",
             parse_mode="html")
@@ -227,7 +228,7 @@ async def cmd_request(e):
     if len(parts) == 2 and parts[1].isdigit():
         query, ep = parts[0], int(parts[1])
 
-    m = await e.respond("🔎 <b>Searching AniList • AniLive • AnimXin • "
+    m = await flood_respond(e, "🔎 <b>Searching AniList • AniLive • AnimXin • "
                         "LuciferDonghua…</b>", parse_mode="html")
     meta = await build_metadata(query,
                                 anilive_base=await store.get_config(
@@ -300,10 +301,10 @@ async def cmd_search(e):
         return await forcesub_gate(e, fs)
     args = e.raw_text.split(None, 1)
     if len(args) < 2:
-        return await e.respond("📌 <b>Usage:</b> /search &lt;anime name&gt; "
+        return await flood_respond(e, "📌 <b>Usage:</b> /search &lt;anime name&gt; "
                                  "[episode]\nExample: <code>/search Soul Land "
                                  "5</code>", parse_mode="html")
-    m = await e.respond("🔎 <b>Searching the file store…</b>",
+    m = await flood_respond(e, "🔎 <b>Searching the file store…</b>",
                           parse_mode="html")
     recs = await store.search_files(args[1].strip(), limit=10)
     if not recs:
@@ -337,16 +338,16 @@ async def cmd_get(e):
         return await forcesub_gate(e, fs)
     args = e.raw_text.split(None, 1)
     if len(args) < 2:
-        return await e.respond("📌 <b>Usage:</b> /get &lt;anime name&gt; "
+        return await flood_respond(e, "📌 <b>Usage:</b> /get &lt;anime name&gt; "
                                  "[episode]", parse_mode="html")
     recs = await store.search_files(args[1].strip(), limit=1)
     if not recs:
-        return await e.respond("📭 Not in the store yet. Use /search to "
+        return await flood_respond(e, "📭 Not in the store yet. Use /search to "
                                  "browse, or /request to ask.",
                                  parse_mode="html")
     from handlers_files import serve_file
     got = await serve_file(e.sender_id, recs[0])
-    await e.respond("📥 <b>File sent!</b> Check your downloads 👇"
+    await flood_respond(e, "📥 <b>File sent!</b> Check your downloads 👇"
                     if got else
                     "❌ File unavailable right now — ask an admin.",
                     parse_mode="html")
@@ -376,9 +377,9 @@ async def unknown_cmd(e):
     if cmd in KNOWN_COMMANDS:
         return  # handled by its own handler
     if await is_admin(e.sender_id):
-        return await e.respond("❓ Unknown command. Send /help.")
+        return await flood_respond(e, "❓ Unknown command. Send /help.")
     from style import RESTRICTED_MSG
-    await e.respond(RESTRICTED_MSG, parse_mode="html")
+    await flood_respond(e, RESTRICTED_MSG, parse_mode="html")
 
 
 # ---------------------------------------------------------------------- #
@@ -413,17 +414,17 @@ async def cb_dec(e):
 
 @app.on(events.CallbackQuery(pattern=rb"usr:commands"))
 async def cb_usr_commands(e):
-    await e.respond(USER_COMMANDS_TEXT, parse_mode="html")
+    await flood_respond(e, USER_COMMANDS_TEXT, parse_mode="html")
 
 
 @app.on(events.CallbackQuery(pattern=rb"usr:sources"))
 async def cb_usr_sources(e):
-    await e.respond(SOURCES_TEXT, parse_mode="html")
+    await flood_respond(e, SOURCES_TEXT, parse_mode="html")
 
 
 @app.on(events.CallbackQuery(pattern=rb"usr:changelog"))
 async def cb_usr_changelog(e):
-    await e.respond(CHANGELOG_TEXT, parse_mode="html")
+    await flood_respond(e, CHANGELOG_TEXT, parse_mode="html")
 
 
 @app.on(events.CallbackQuery(pattern=rb"usr:close"))

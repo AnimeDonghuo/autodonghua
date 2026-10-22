@@ -24,7 +24,8 @@ from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from backup import backup_filename, backup_summary, load_backup, write_backup
 from config import BACKUP_DIR, CONFIG, save_config
 from core import (app, get_pass, is_owner, login, logout,
-                  require_staff, resolve_channel, store, wait_for)
+                  require_staff, resolve_channel, store, wait_for,
+                  flood_respond, flood_edit)
 from parser import normalize_key
 from style import ADMIN_HOME, escape_html
 
@@ -70,7 +71,7 @@ async def cmd_addchannel(e):
         return
     parts = e.raw_text.split()
     if len(parts) < 2:
-        return await e.respond(
+        return await flood_respond(e, 
             "📌 <b>Usage:</b> /addchannel &lt;channel_id or @username&gt; [tag]\n\n"
             "Example: <code>/addchannel -1001234567890 1080p</code>",
             parse_mode="html")
@@ -78,7 +79,7 @@ async def cmd_addchannel(e):
     try:
         ent = await resolve_channel(target)
     except Exception:
-        return await e.respond(
+        return await flood_respond(e, 
             "❌ Can't reach that channel.\n\n"
             "The bot must be an admin there. If it already is, "
             "try one of these instead of the raw id:\n"
@@ -87,7 +88,7 @@ async def cmd_addchannel(e):
             "• use @username or an invite link")
     from telethon.tl.types import Channel, Chat
     if not isinstance(ent, (Channel, Chat)):
-        return await e.respond(
+        return await flood_respond(e, 
             "❌ That id belongs to a USER, not a channel.\n"
             "Send the CHANNEL id (the -100… one), its "
             "@username, or an invite link.")
@@ -95,7 +96,7 @@ async def cmd_addchannel(e):
     await store.add_channel(ent.id, tag,
                             title=getattr(ent, "title", None))
     _spawn_backlog(ent.id)
-    await e.respond(
+    await flood_respond(e, 
         f"✅ <b>Channel Added</b>\n\n"
         f"📢 <b>Name:</b> {escape_html(getattr(ent, 'title', '?'))}\n"
         f"🆔 <b>ID:</b> <code>{ent.id}</code>\n"
@@ -112,7 +113,7 @@ async def cmd_channels(e):
         return
     chans = await store.list_channels()
     if not chans:
-        return await e.respond("📭 No posting channels yet. Use /addchannel.")
+        return await flood_respond(e, "📭 No posting channels yet. Use /addchannel.")
     lines = ["📢 <b>Posting Channels</b>\n"]
     kb = []
     for c in chans:
@@ -120,7 +121,7 @@ async def cmd_channels(e):
                      f"🏷 <i>{escape_html(c.get('tag') or '')}</i>")
         kb.append([Button.inline(f"🗑 Delete {c['_id']}",
                                  b"adm:delchan:" + str(c["_id"]).encode())])
-    await e.respond("\n".join(lines), parse_mode="html", buttons=kb)
+    await flood_respond(e, "\n".join(lines), parse_mode="html", buttons=kb)
 
 
 @app.on(events.CallbackQuery(pattern=rb"adm:delchan:(-?\d+)"))
@@ -129,7 +130,7 @@ async def cb_delchan(e):
         return await e.answer("⛔ Admins only", alert=True)
     cid = int(e.pattern_match.group(1).decode())
     await store.remove_channel(cid)
-    await e.edit(f"✅ Channel <code>{cid}</code> removed.", parse_mode="html")
+    await flood_edit(e, f"✅ Channel <code>{cid}</code> removed.", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/buttonchannel(?:\s|$)"))
@@ -138,7 +139,7 @@ async def cmd_buttonchannel(e):
         return
     text = e.raw_text[len("/buttonchannel"):].strip()
     if not text:
-        return await e.respond(
+        return await flood_respond(e, 
             "📌 <b>Usage:</b> /buttonchannel &lt;channel link&gt; &lt;button name&gt;\n\n"
             "Example: <code>/buttonchannel https://t.me/donghahub 🎬 Donghua Hub</code>",
             parse_mode="html")
@@ -148,7 +149,7 @@ async def cmd_buttonchannel(e):
         url = "https://t.me/" + url.lstrip("@")
     name = parts[1].strip() if len(parts) > 1 else url
     await store.add_button_channel(name, url)
-    await e.respond(f"✅ Button added: <b>{escape_html(name)}</b> → "
+    await flood_respond(e, f"✅ Button added: <b>{escape_html(name)}</b> → "
                     f"{escape_html(url)}", parse_mode="html")
 
 
@@ -158,14 +159,14 @@ async def cmd_buttonchannels(e):
         return
     bcs = await store.list_button_channels()
     if not bcs:
-        return await e.respond("📭 No button channels yet. Use /buttonchannel.")
+        return await flood_respond(e, "📭 No button channels yet. Use /buttonchannel.")
     lines = ["🔘 <b>Menu Button Channels</b>\n"]
     kb = []
     for b in bcs:
         lines.append(f"• <b>{escape_html(b['_id'])}</b> → {escape_html(b['url'])}")
         kb.append([Button.inline(f"🗑 {b['_id'][:30]}",
                                  b"adm:delbtn:" + b["_id"][:40].encode())])
-    await e.respond("\n".join(lines), parse_mode="html", buttons=kb)
+    await flood_respond(e, "\n".join(lines), parse_mode="html", buttons=kb)
 
 
 @app.on(events.CallbackQuery(pattern=rb"adm:delbtn:(.+)"))
@@ -174,7 +175,7 @@ async def cb_delbtn(e):
         return await e.answer("⛔ Admins only", alert=True)
     name = e.pattern_match.group(1).decode()
     await store.remove_button_channel(name)
-    await e.edit(f"✅ Button <b>{escape_html(name)}</b> removed.", parse_mode="html")
+    await flood_edit(e, f"✅ Button <b>{escape_html(name)}</b> removed.", parse_mode="html")
 
 
 # ---------------------------------------------------------------------- #
@@ -187,7 +188,7 @@ async def cmd_forcesub(e):
     parts = e.raw_text.split()
     mode = parts[1].lower() if len(parts) > 1 else None
     if mode not in ("off", "strict", "request"):
-        return await e.respond(
+        return await flood_respond(e, 
             "🔒 <b>Force Subscribe</b>\n\n"
             "<b>Modes:</b>\n"
             "• <code>/forcesub off</code> — disabled\n"
@@ -204,7 +205,7 @@ async def cmd_forcesub(e):
             try:
                 ent = await resolve_channel(parts[2])
             except Exception:
-                return await e.respond("❌ Can't reach that channel — the bot "
+                return await flood_respond(e, "❌ Can't reach that channel — the bot "
                            "must be an admin there (or send this "
                            "command inside it once).")
             if ent.id not in channels:
@@ -213,7 +214,7 @@ async def cmd_forcesub(e):
     mode_name = {"off": "OFF 🚫",
                  "strict": "STRICT — join first, then files ✅",
                  "request": "JOIN REQUEST — send request, then files 📩"}[mode]
-    await e.respond(
+    await flood_respond(e, 
         f"🔒 <b>Force Sub Updated</b>\n\n"
         f"Mode: <b>{mode_name}</b>\n"
         f"Channels: {', '.join('<code>%d</code>' % c for c in channels) or '—'}",
@@ -235,25 +236,25 @@ async def cmd_addmongodb(e):
             uri = rep.text.strip().split()[0]
     if not uri:
         PENDING[e.sender_id] = "addmongodb"
-        return await e.respond(
+        return await flood_respond(e, 
             "📌 Send the MongoDB URI now, in one message:\n"
             "<code>mongodb+srv://user:pass@cluster/x</code>\n\n"
             "The URI is saved permanently — it survives restarts, and "
             "even if storage is full you can add more URIs (auto "
             "fail-over).", parse_mode="html")
     if not uri.startswith("mongodb"):
-        return await e.respond("❌ That doesn't look like a MongoDB URI "
+        return await flood_respond(e, "❌ That doesn't look like a MongoDB URI "
                                "(must start with mongodb:// or mongodb+srv://).")
     await store.add_mongo_uri(uri)
     ok = await store._try_connect(uri)
     if ok:
         store.mode = "mongo"
-        await e.respond(f"✅ <b>MongoDB Connected & Saved</b>\n\n"
+        await flood_respond(e, f"✅ <b>MongoDB Connected & Saved</b>\n\n"
                         f"<code>{escape_html(uri[:60])}</code>…\n\n"
                         f"All data now lives in MongoDB and survives restarts.",
                         parse_mode="html")
     else:
-        await e.respond(f"⚠️ URI saved but connection failed — check the string:\n"
+        await flood_respond(e, f"⚠️ URI saved but connection failed — check the string:\n"
                         f"<code>{escape_html(uri[:50])}</code>…", parse_mode="html")
     # mirror the list into the live DB for redundancy
     await store.set_config("mongo_uris", store.uris)
@@ -264,15 +265,15 @@ async def cmd_setowner(e):
     """Claim/transfer the owner slot (panels, queue, cancels)."""
     ids = CONFIG.get("owner_ids") or []
     if ids and int(e.sender_id) not in [int(i) for i in ids]:
-        return await e.respond("👑 Owner only.")
+        return await flood_respond(e, "👑 Owner only.")
     if not ids and not await store.is_admin(e.sender_id):
-        return await e.respond("👑 An admin/owner must claim this.")
+        return await flood_respond(e, "👑 An admin/owner must claim this.")
     CONFIG["owner_ids"] = [int(e.sender_id)]
     save_config()
     await store.save_runtime()
     import autodl as _ad
     _ad.OWNER_ENT = None
-    await e.respond(f"👑 <b>Owner set</b> to <code>{e.sender_id}</code> — "
+    await flood_respond(e, f"👑 <b>Owner set</b> to <code>{e.sender_id}</code> — "
                     f"progress panels &amp; batch reports will be "
                     f"DM'd to you.", parse_mode="html")
 
@@ -282,13 +283,13 @@ async def cmd_mongos(e):
     if not await require_staff(e):
         return
     if not store.uris:
-        return await e.respond("🗄 No MongoDB URIs yet. Use /addmongodb.")
+        return await flood_respond(e, "🗄 No MongoDB URIs yet. Use /addmongodb.")
     lines = ["🗄 <b>MongoDB URIs</b>\n"]
     for i, u in enumerate(store.uris, 1):
         mark = " <b>(active)</b>" if u == store.active_uri else ""
         lines.append(f"{i}. <code>{escape_html(u[:44])}</code>…{mark}")
     lines.append(f"\nMode: <b>{store.mode.upper()}</b>")
-    await e.respond("\n".join(lines), parse_mode="html")
+    await flood_respond(e, "\n".join(lines), parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/delmongodb(?:\s|$)"))
@@ -297,16 +298,16 @@ async def cmd_delmongodb(e):
         return
     parts = e.raw_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        return await e.respond("📌 Usage: /delmongodb &lt;number&gt;  (see /mongos)")
+        return await flood_respond(e, "📌 Usage: /delmongodb &lt;number&gt;  (see /mongos)")
     idx = int(parts[1]) - 1
     if not (0 <= idx < len(store.uris)):
-        return await e.respond("❌ Invalid number.")
+        return await flood_respond(e, "❌ Invalid number.")
     removed = store.uris.pop(idx)
     CONFIG["mongo_uris"] = store.uris
     save_config()
     if store.active_uri == removed:
         await store.init()
-    await e.respond(f"✅ Removed MongoDB #{idx + 1}:\n"
+    await flood_respond(e, f"✅ Removed MongoDB #{idx + 1}:\n"
                     f"<code>{escape_html(removed[:50])}</code>…", parse_mode="html")
 
 
@@ -317,7 +318,7 @@ async def cmd_delmongodb(e):
 async def cmd_backup(e):
     if not await require_staff(e):
         return
-    m = await e.respond("💾 <b>Creating backup…</b>", parse_mode="html")
+    m = await flood_respond(e, "💾 <b>Creating backup…</b>", parse_mode="html")
     data = await store.backup_all()
     path = os.path.join(BACKUP_DIR, backup_filename())
     with open(path, "w", encoding="utf-8") as f:
@@ -333,7 +334,7 @@ async def cmd_backup(e):
         except Exception as ex:
             sent.append(f"db channel failed ({ex})")
     try:
-        await e.respond(file=path,
+        await flood_respond(e, file=path,
                         caption=caption + "\n\n📌 Keep this file safe — use "
                                 "/recover to restore everything from it.",
                         parse_mode="html")
@@ -345,14 +346,14 @@ async def cmd_backup(e):
                             "collections": {k: len(v) for k, v in
                                             data["collections"].items()}})
     await m.delete()
-    await e.respond(f"✅ Backup saved to: <b>{', '.join(sent)}</b>", parse_mode="html")
+    await flood_respond(e, f"✅ Backup saved to: <b>{', '.join(sent)}</b>", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/recover$"))
 async def cmd_recover(e):
     if not await require_staff(e):
         return
-    await e.respond("📥 <b>Recovery Mode</b>\n\nSend the backup JSON file now "
+    await flood_respond(e, "📥 <b>Recovery Mode</b>\n\nSend the backup JSON file now "
                     "(forward the one from your DB channel). I'll restore "
                     "everything — channels, images, users, files & settings.\n\n"
                     "<i>Waiting 3 minutes…</i>", parse_mode="html")
@@ -360,15 +361,15 @@ async def cmd_recover(e):
                          filt=lambda m: m.document and
                          m.document.name.endswith(".json"))
     if not msg:
-        return await e.respond("⏱ Recovery cancelled (timeout).")
+        return await flood_respond(e, "⏱ Recovery cancelled (timeout).")
     path = await app.download_media(msg.media)
     try:
         data = load_backup(path)
     except Exception as ex:
-        return await e.respond(f"❌ Invalid backup file: {ex}")
+        return await flood_respond(e, f"❌ Invalid backup file: {ex}")
     counts = await store.restore_all(data)
     summary = "\n".join(f"• {k}: <b>{v}</b>" for k, v in counts.items())
-    await e.respond(f"♻️ <b>Recovery Complete</b>\n\n{summary}\n\n"
+    await flood_respond(e, f"♻️ <b>Recovery Complete</b>\n\n{summary}\n\n"
                     f"The bot is fully restored — even after deletion or a ban, "
                     f"your data comes back with /recover.", parse_mode="html")
 
@@ -380,23 +381,23 @@ async def cmd_dbchannel(e):
     parts = e.raw_text.split()
     if len(parts) < 2:
         cur = await store.get_config("db_channel")
-        return await e.respond(f"📌 Current DB channel: <code>{cur}</code>\n"
+        return await flood_respond(e, f"📌 Current DB channel: <code>{cur}</code>\n"
                                f"Usage: /dbchannel &lt;channel_id&gt;",
                                parse_mode="html")
     try:
         ent = await resolve_channel(parts[1])
     except Exception:
-        return await e.respond("❌ Can't reach that channel — the bot "
+        return await flood_respond(e, "❌ Can't reach that channel — the bot "
                            "must be an admin there (or send this "
                            "command inside it once).")
     from telethon.tl.types import Channel, Chat
     if not isinstance(ent, (Channel, Chat)):
-        return await e.respond(
+        return await flood_respond(e, 
             "❌ That id belongs to a USER, not a channel.\n"
             "Send the CHANNEL id (the -100… one), its "
             "@username, or an invite link.")
     await store.set_config("db_channel", ent.id)
-    await e.respond(f"✅ Backups will be posted in "
+    await flood_respond(e, f"✅ Backups will be posted in "
                     f"<b>{escape_html(getattr(ent, 'title', '?'))}</b> "
                     f"(<code>{ent.id}</code>).", parse_mode="html")
 
@@ -408,16 +409,16 @@ async def cmd_setlog(e):
     parts = e.raw_text.split()
     if len(parts) < 2:
         cur = await store.get_config("log_channel")
-        return await e.respond(f"📌 Log channel: <code>{cur}</code>",
+        return await flood_respond(e, f"📌 Log channel: <code>{cur}</code>",
                                parse_mode="html")
     try:
         ent = await resolve_channel(parts[1])
     except Exception:
-        return await e.respond("❌ Can't reach that channel — the bot "
+        return await flood_respond(e, "❌ Can't reach that channel — the bot "
                            "must be an admin there (or send this "
                            "command inside it once).")
     await store.set_config("log_channel", ent.id)
-    await e.respond(f"✅ Request logs go to <b>{escape_html(getattr(ent, 'title', '?'))}</b>.",
+    await flood_respond(e, f"✅ Request logs go to <b>{escape_html(getattr(ent, 'title', '?'))}</b>.",
                     parse_mode="html")
 
 
@@ -431,14 +432,14 @@ async def cmd_setimg(e):
     text = e.raw_text[len("/setimg"):].strip()
     parts = text.rsplit(None, 1)
     if len(parts) < 2 or not parts[1].startswith("http"):
-        return await e.respond(
+        return await flood_respond(e, 
             "📌 <b>Usage:</b> /setimg &lt;anime title&gt; &lt;image url&gt;\n\n"
             "Example: <code>/setimg Soul Land https://img.jpg</code>\n\n"
             "The image is saved by title — every future post with the same "
             "name (any episode) automatically reuses it.", parse_mode="html")
     title, url = parts[0].strip(), parts[1].strip()
     await store.save_image(normalize_key(title), url=url, source="custom", custom=True)
-    await e.respond(f"🖼 Image saved for <b>{escape_html(title)}</b>.\n"
+    await flood_respond(e, f"🖼 Image saved for <b>{escape_html(title)}</b>.\n"
                     f"All future posts of this title will use it automatically.",
                     parse_mode="html")
 
@@ -452,14 +453,14 @@ async def cmd_setpaid(e):
         return
     parts = e.raw_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        return await e.respond("📌 Usage: /setpaid &lt;user_id&gt; [paid|free]")
+        return await flood_respond(e, "📌 Usage: /setpaid &lt;user_id&gt; [paid|free]")
     uid = int(parts[1])
     tier = parts[2].lower() if len(parts) > 2 else None
     if tier not in ("paid", "free"):
         cur = await store.get_user(uid)
         tier = "free" if (cur or {}).get("tier") == "paid" else "paid"
     await store.set_tier(uid, tier)
-    await e.respond(f"💎 User <code>{uid}</code> is now <b>{tier.upper()}</b>.",
+    await flood_respond(e, f"💎 User <code>{uid}</code> is now <b>{tier.upper()}</b>.",
                     parse_mode="html")
 
 
@@ -468,12 +469,12 @@ async def cmd_addadmin(e):
     if not await require_staff(e):
         return
     if not is_owner(e.sender_id):
-        return await e.respond("👑 Owner only.")
+        return await flood_respond(e, "👑 Owner only.")
     parts = e.raw_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        return await e.respond("📌 Usage: /addadmin &lt;user_id&gt;")
+        return await flood_respond(e, "📌 Usage: /addadmin &lt;user_id&gt;")
     await store.add_admin(int(parts[1]))
-    await e.respond(f"✅ <code>{parts[1]}</code> is now an admin.", parse_mode="html")
+    await flood_respond(e, f"✅ <code>{parts[1]}</code> is now an admin.", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/deladmin(?:\s|$)"))
@@ -481,12 +482,12 @@ async def cmd_deladmin(e):
     if not await require_staff(e):
         return
     if not is_owner(e.sender_id):
-        return await e.respond("👑 Owner only.")
+        return await flood_respond(e, "👑 Owner only.")
     parts = e.raw_text.split()
     if len(parts) < 2 or not parts[1].isdigit():
-        return await e.respond("📌 Usage: /deladmin &lt;user_id&gt;")
+        return await flood_respond(e, "📌 Usage: /deladmin &lt;user_id&gt;")
     await store.remove_admin(int(parts[1]))
-    await e.respond(f"✅ Admin <code>{parts[1]}</code> removed.", parse_mode="html")
+    await flood_respond(e, f"✅ Admin <code>{parts[1]}</code> removed.", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/admins$"))
@@ -499,7 +500,7 @@ async def cmd_admins(e):
              "🛡 <b>Admins:</b>"]
     for a in admins:
         lines.append(f"• <code>{a['_id']}</code>")
-    await e.respond("\n".join(lines), parse_mode="html")
+    await flood_respond(e, "\n".join(lines), parse_mode="html")
 
 
 # ---------------------------------------------------------------------- #
@@ -516,7 +517,7 @@ async def cmd_users(e):
         out.append(f"• <code>{u['_id']}</code> — {escape_html(u.get('first_name') or '?')} "
                    f"@{u.get('username') or '-'} [{u.get('tier')}] "
                    f"used: {u.get('bytes_used', 0) // 1048576} MB")
-    await e.respond("\n".join(out), parse_mode="html")
+    await flood_respond(e, "\n".join(out), parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/usage$"))
@@ -531,7 +532,7 @@ async def cmd_usage(e):
     for k, v in st["collections"].items():
         out.append(f"• {k}: {v}")
     out.append(f"\n📁 Files posted: <b>{files}</b>")
-    await e.respond("\n".join(out), parse_mode="html")
+    await flood_respond(e, "\n".join(out), parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/stats$"))
@@ -539,7 +540,7 @@ async def cmd_stats(e):
     if not await require_staff(e):
         return
     st = await store.stats()
-    await e.respond(
+    await flood_respond(e, 
         f"📈 <b>Bot Stats</b>\n\n"
         f"📺 Posting channels: <b>{st['collections'].get('channels', 0)}</b>\n"
         f"🔘 Button channels: <b>{st['collections'].get('button_channels', 0)}</b>\n"
@@ -561,7 +562,7 @@ async def cmd_broadcast(e):
         r = await e.get_reply_message()
         text = r.text or r.raw_text or ""
     if not text:
-        return await e.respond("📌 Usage: /broadcast &lt;message&gt; "
+        return await flood_respond(e, "📌 Usage: /broadcast &lt;message&gt; "
                                "or reply to a message.")
     users = await store.list_users(limit=10000)
     ok = fail = 0
@@ -572,7 +573,7 @@ async def cmd_broadcast(e):
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await e.respond(f"📢 Broadcast done: <b>{ok}</b> sent, <b>{fail}</b> failed.",
+    await flood_respond(e, f"📢 Broadcast done: <b>{ok}</b> sent, <b>{fail}</b> failed.",
                     parse_mode="html")
 
 
@@ -583,11 +584,11 @@ async def cmd_setsource(e):
     parts = e.raw_text.split()
     if len(parts) >= 3 and parts[1].lower() == "anilive":
         await store.set_config("anilive_base", parts[2].strip().rstrip("/"))
-        await e.respond(f"✅ AniLive base URL set to "
+        await flood_respond(e, f"✅ AniLive base URL set to "
                         f"<code>{escape_html(parts[2])}</code>", parse_mode="html")
     else:
         cur = await store.get_config("anilive_base")
-        await e.respond(f"📌 Usage: /setsource anilive &lt;base_url&gt;\n"
+        await flood_respond(e, f"📌 Usage: /setsource anilive &lt;base_url&gt;\n"
                         f"Current: <code>{cur or 'https://anilive.app'}</code>",
                         parse_mode="html")
 
@@ -599,7 +600,7 @@ async def cmd_sync(e):
     cmds = [BotCommand(c, d) for c, d in COMMAND_MENU]
     await app(SetBotCommandsRequest(commands=cmds,
                                     scope=BotCommandScopeDefault(), lang_code=""))
-    await e.respond(f"✅ <b>Commands synced!</b> {len(cmds)} commands are now "
+    await flood_respond(e, f"✅ <b>Commands synced!</b> {len(cmds)} commands are now "
                     f"visible in the bot menu:\n\n" +
                     "\n".join(f"• <code>/{c}</code> — {d}" for c, d in COMMAND_MENU),
                     parse_mode="html")
@@ -622,9 +623,9 @@ async def cmd_help(e):
                 "• /usage · /stats · /users · /broadcast\n"
                 "• /setsource anilive &lt;base_url&gt;\n"
                 "• /sync — refresh bot command menu")
-        return await e.respond(text, parse_mode="html")
+        return await flood_respond(e, text, parse_mode="html")
     from style import WELCOME_TEMPLATE
-    await e.respond(WELCOME_TEMPLATE.format(
+    await flood_respond(e, WELCOME_TEMPLATE.format(
         username=e.sender.first_name or "Friend"), parse_mode="html")
 
 
@@ -635,22 +636,22 @@ async def cmd_help(e):
 async def cmd_login(e):
     parts = e.raw_text.split()
     if len(parts) < 2:
-        return await e.respond("🔑 <b>Staff Login</b>\n\n"
+        return await flood_respond(e, "🔑 <b>Staff Login</b>\n\n"
                                "Usage: <code>/login &lt;password&gt;</code>",
                                parse_mode="html")
     if parts[1].strip() == await get_pass():
         await login(e.sender_id)
-        await e.respond("✅ <b>Logged in!</b> Admin panel unlocked.\n"
+        await flood_respond(e, "✅ <b>Logged in!</b> Admin panel unlocked.\n"
                         "Use /logout when done on a shared device.",
                         parse_mode="html")
     else:
-        await e.respond("❌ Wrong password.", parse_mode="html")
+        await flood_respond(e, "❌ Wrong password.", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/logout$"))
 async def cmd_logout(e):
     await logout(e.sender_id)
-    await e.respond("👋 Logged out. Admin commands are locked again.")
+    await flood_respond(e, "👋 Logged out. Admin commands are locked again.")
 
 
 @app.on(events.NewMessage(pattern=r"^/setpass(?:\s|$)"))
@@ -658,18 +659,18 @@ async def cmd_setpass(e):
     if not await require_staff(e):
         return
     if not is_owner(e.sender_id):
-        return await e.respond("👑 <b>Owner only</b> — you must be "
+        return await flood_respond(e, "👑 <b>Owner only</b> — you must be "
                                "logged in as the owner to change the "
                                "password.", parse_mode="html")
     parts = e.raw_text.split()
     if len(parts) < 2:
-        return await e.respond("📌 Usage: /setpass &lt;new_password&gt;\n\n"
+        return await flood_respond(e, "📌 Usage: /setpass &lt;new_password&gt;\n\n"
                                "(you must be logged in — owner only)")
     new_pass = parts[1].strip()
     if len(new_pass) < 3:
-        return await e.respond("❌ Password too short (min 3 chars).")
+        return await flood_respond(e, "❌ Password too short (min 3 chars).")
     await store.set_config("admin_pass", new_pass)
-    await e.respond(f"✅ Password changed. Old sessions stay valid until "
+    await flood_respond(e, f"✅ Password changed. Old sessions stay valid until "
                     f"/logout.", parse_mode="html")
 
 
@@ -680,7 +681,7 @@ async def cmd_setdbchannel(e):
     parts = e.raw_text.split()
     if len(parts) < 2:
         cur = await store.get_config("db_channel")
-        return await e.respond(
+        return await flood_respond(e, 
             f"🗂 <b>TG DB Channel</b> (file archive + backups)\n\n"
             f"Current: <code>{cur}</code>\n"
             f"Usage: /setdbchannel &lt;channel_id&gt;\n\n"
@@ -690,14 +691,14 @@ async def cmd_setdbchannel(e):
     try:
         ent = await resolve_channel(parts[1])
     except Exception:
-        return await e.respond(
+        return await flood_respond(e, 
             "❌ Can't reach that channel.\n\n"
             "The bot must be an admin there. If it already is, "
             "the id has no access hash yet — send this command "
             "INSIDE that channel once, or forward any message "
             "from it to me, or use @username / invite link.")
     await store.set_config("db_channel", ent.id)
-    await e.respond(f"✅ DB channel set to "
+    await flood_respond(e, f"✅ DB channel set to "
                     f"<b>{escape_html(getattr(ent, 'title', '?'))}</b> "
                     f"(<code>{ent.id}</code>). Files will be archived "
                     f"here.", parse_mode="html")
@@ -719,20 +720,20 @@ async def cmd_setstartimg(e):
     if media_msg is not None:
         fid = utils.pack_bot_file_id(media_msg.media)
         await store.set_config("start_image", fid)
-        return await e.respond("✅ /start banner set to the "
+        return await flood_respond(e, "✅ /start banner set to the "
                                "replied photo.", parse_mode="html")
     if arg.lower() in ("off", "clear", "none"):
         await store.set_config("start_image", "")
-        return await e.respond("🗑 /start banner removed — the "
+        return await flood_respond(e, "🗑 /start banner removed — the "
                                "card is text-only now.",
                                parse_mode="html")
     if arg.startswith(("http://", "https://")):
         await store.set_config("start_image", arg)
-        return await e.respond("✅ /start banner set to that "
+        return await flood_respond(e, "✅ /start banner set to that "
                                "image URL.", parse_mode="html")
     # no arg, no reply: wait for the next photo / url message
     PENDING[e.sender_id] = "setstartimg"
-    await e.respond("🖼 Send the banner now — either an image "
+    await flood_respond(e, "🖼 Send the banner now — either an image "
                     "(upload or file) or a direct image URL in one "
                     "message.\n<code>/setstartimg off</code> removes "
                     "it.", parse_mode="html")
@@ -750,14 +751,14 @@ async def cmd_adddbchannel(e):
         lines = "\n".join(f"• <code>{d['_id']}</code> — "
                           f"{escape_html(d.get('title') or '?')}"
                           for d in cur) or "• none yet"
-        return await e.respond(
+        return await flood_respond(e, 
             f"🗄 <b>DB channels:</b>\n{lines}\n\n"
             f"Usage: /adddbchannel &lt;channel_id or @username&gt;",
             parse_mode="html")
     try:
         ent = await resolve_channel(parts[1])
     except Exception:
-        return await e.respond(
+        return await flood_respond(e, 
             "❌ Can't reach that channel.\n\n"
             "The bot must be an admin there. If it already is, "
             "the id has no access hash yet — send this command "
@@ -765,7 +766,7 @@ async def cmd_adddbchannel(e):
             "from it to me, or use @username / invite link.")
     from telethon.tl.types import Channel, Chat
     if not isinstance(ent, (Channel, Chat)):
-        return await e.respond(
+        return await flood_respond(e, 
             "❌ That id belongs to a USER, not a channel.\n"
             "Send the CHANNEL id (the -100… one), its "
             "@username, or an invite link.")
@@ -773,7 +774,7 @@ async def cmd_adddbchannel(e):
                                title=getattr(ent, "title", None))
     await store.set_config("db_channel", ent.id)  # legacy primary
     n = len(await store.list_db_channels())
-    await e.respond(
+    await flood_respond(e, 
         f"✅ <b>DB channel added</b>\n\n"
         f"📢 {escape_html(getattr(ent, 'title', '?'))} "
         f"(<code>{ent.id}</code>)\n"
@@ -788,12 +789,12 @@ async def cmd_dbchannels(e):
         return
     cur = await store.list_db_channels()
     if not cur:
-        return await e.respond("🗄 No DB channels yet — add one "
+        return await flood_respond(e, "🗄 No DB channels yet — add one "
                                "with /adddbchannel <id>.")
     lines = "\n".join(f"• <code>{d['_id']}</code> — "
                       f"{escape_html(d.get('title') or '?')}"
                       for d in cur)
-    await e.respond(f"🗄 <b>DB channels ({len(cur)}):</b>\n{lines}\n\n"
+    await flood_respond(e, f"🗄 <b>DB channels ({len(cur)}):</b>\n{lines}\n\n"
                     f"Remove: /deldbchannel &lt;id&gt;",
                     parse_mode="html")
 
@@ -804,14 +805,14 @@ async def cmd_deldbchannel(e):
         return
     parts = e.raw_text.split()
     if len(parts) < 2:
-        return await e.respond("📌 Usage: /deldbchannel "
+        return await flood_respond(e, "📌 Usage: /deldbchannel "
                                "&lt;channel_id&gt;")
     try:
         cid = int(parts[1])
     except ValueError:
-        return await e.respond("📌 That is not a channel id.")
+        return await flood_respond(e, "📌 That is not a channel id.")
     await store.remove_db_channel(cid)
-    await e.respond(f"🗑 DB channel <code>{cid}</code> removed.",
+    await flood_respond(e, f"🗑 DB channel <code>{cid}</code> removed.",
                     parse_mode="html")
 
 
@@ -833,7 +834,7 @@ async def cmd_settag(e):
         lines = "\n".join(f"• <code>{c['_id']}</code> — tag: "
                           f"<b>{escape_html(c.get('tag') or 'indo')}</b>"
                           for c in chans) or "• no channels yet"
-        return await e.respond(
+        return await flood_respond(e, 
             f"🏷 <b>Channel tags</b>\n{lines}\n\n"
             f"Usage: /settag &lt;channel_id&gt; &lt;tag&gt;\n"
             f"• <b>indo</b> → base qualities 360p…1080p\n"
@@ -842,11 +843,11 @@ async def cmd_settag(e):
     from core import norm_channel_id
     cid = norm_channel_id(parts[1])
     if cid is None:
-        return await e.respond("📌 That is not a channel id.")
+        return await flood_respond(e, "📌 That is not a channel id.")
     tag = " ".join(parts[2:]).strip().lower()
     await store.set_channel_tag(cid, tag)
     _spawn_backlog(cid)
-    await e.respond(
+    await flood_respond(e, 
         f"🏷 Tag for <code>{cid}</code> → <b>{escape_html(tag)}</b>\n"
         + ("Only -eng streams will be posted there (already "
            "archived ones get their cards one by one)."
@@ -994,7 +995,7 @@ async def cb_cmd(e):
     else:
         PENDING[e.sender_id] = cmd
         await e.answer(f"⌨ /{cmd} — send the arguments")
-        await e.respond(
+        await flood_respond(e, 
             f"⌨ <b>/{cmd}</b> — send the arguments now in one "
             f"message.\nExample: <code>{escape_html(hint)}</code>",
             parse_mode="html")

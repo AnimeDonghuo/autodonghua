@@ -8,7 +8,7 @@ from telethon import events
 from telethon.tl.custom import Button
 
 import autodl
-from core import app, is_owner, require_staff, store
+from core import app, is_owner, require_staff, store, flood_respond, flood_edit
 from handlers_files import serve_file
 from handlers_user import forcesub_gate
 from style import escape_html
@@ -27,7 +27,7 @@ async def cmd_autodl(e):
         await autodl.save_settings(st)
         pending = len(await autodl.check_new())
         qtxt = ", ".join(st["qualities"]) or "all"
-        await e.respond(
+        await flood_respond(e, 
             f"🤖 <b>AutoDL ENABLED</b>\n\n"
             f"Watching every <b>{st['interval']} min</b> — any "
             f"episode the DB does NOT have yet is downloaded "
@@ -41,54 +41,54 @@ async def cmd_autodl(e):
     elif sub == "off":
         st["enabled"] = False
         await autodl.save_settings(st)
-        await e.respond("🤖 <b>AutoDL DISABLED</b>",
+        await flood_respond(e, "🤖 <b>AutoDL DISABLED</b>",
                         parse_mode="html")
     elif sub == "qualities" and len(parts) > 2:
         if parts[2].lower() == "all":
             st["qualities"] = []
             await autodl.save_settings(st)
-            return await e.respond("✅ Qualities: <b>all</b> — every "
+            return await flood_respond(e, "✅ Qualities: <b>all</b> — every "
                                      "quality the API offers, per "
                                      "channel tag.",
                                      parse_mode="html")
         qs = [q.strip().lower() for q in parts[2].split(",")
               if q.strip()]
         if not qs:
-            return await e.respond("📌 Usage: /autodl qualities "
+            return await flood_respond(e, "📌 Usage: /autodl qualities "
                                      "360p,480p,720p,1080p")
         st["qualities"] = qs
         await autodl.save_settings(st)
-        await e.respond(f"✅ Download qualities set: "
+        await flood_respond(e, f"✅ Download qualities set: "
                         f"<b>{', '.join(qs)}</b>",
                         parse_mode="html")
     elif sub == "interval" and len(parts) > 2 and parts[2].isdigit():
         st["interval"] = max(5, int(parts[2]))
         await autodl.save_settings(st)
-        await e.respond(f"✅ Poll interval: <b>{st['interval']} "
+        await flood_respond(e, f"✅ Poll interval: <b>{st['interval']} "
                         f"min</b>", parse_mode="html")
     elif sub == "sections" and len(parts) > 2:
         secs = [s.strip().lower()
                 for s in parts[2].split(",")
                 if s.strip().lower() in ("donghua", "anime")]
         if not secs:
-            return await e.respond("📌 Usage: /autodl sections "
+            return await flood_respond(e, "📌 Usage: /autodl sections "
                                      "donghua,anime")
         st["sections"] = secs
         await autodl.save_settings(st)
-        await e.respond(f"✅ Watching sections: "
+        await flood_respond(e, f"✅ Watching sections: "
                         f"<b>{', '.join(secs)}</b>",
                         parse_mode="html")
     elif sub == "reset":
         if not is_owner(e.sender_id):
-            return await e.respond("👑 Owner only.")
+            return await flood_respond(e, "👑 Owner only.")
         await autodl.registry_reset()
-        await e.respond("♻️ <b>Download registry cleared</b> — "
+        await flood_respond(e, "♻️ <b>Download registry cleared</b> — "
                         "everything can be downloaded again.",
                         parse_mode="html")
     else:
         items = await autodl.fetch_latest(st["sections"])
         latest = items[0] if items else {}
-        await e.respond(
+        await flood_respond(e, 
             f"🤖 <b>AutoDL Status</b>\n\n"
             f"State: <b>{'🟢 ON' if st['enabled'] else '🔴 OFF'}</b>\n"
             f"Sections: <b>{', '.join(st['sections'])}</b>\n"
@@ -150,7 +150,7 @@ def _sel_buttons(fresh, chosen):
 async def cmd_checknew(e):
     if not await require_staff(e):
         return
-    m = await e.respond("🔍 <b>Checking for new episodes…</b>",
+    m = await flood_respond(e, "🔍 <b>Checking for new episodes…</b>",
                         parse_mode="html")
     fresh = await autodl.check_new()
     if not fresh:
@@ -175,7 +175,7 @@ async def cb_sel_toggle(e):
         st["chosen"].discard(idx)
     else:
         st["chosen"].add(idx)
-    await e.edit(_sel_text(st["fresh"], st["chosen"]),
+    await flood_edit(e, _sel_text(st["fresh"], st["chosen"]),
                  buttons=_sel_buttons(st["fresh"], st["chosen"]),
                  parse_mode="html")
 
@@ -189,7 +189,7 @@ async def cb_sel_all(e):
         st["chosen"] = set(range(len(st["fresh"])))
     else:
         st["chosen"] = set()
-    await e.edit(_sel_text(st["fresh"], st["chosen"]),
+    await flood_edit(e, _sel_text(st["fresh"], st["chosen"]),
                  buttons=_sel_buttons(st["fresh"], st["chosen"]),
                  parse_mode="html")
 
@@ -197,7 +197,7 @@ async def cb_sel_all(e):
 @app.on(events.CallbackQuery(pattern=rb"selcancel"))
 async def cb_sel_cancel(e):
     SEL.pop(e.message_id, None)
-    await e.edit("❌ Selection cancelled.", parse_mode="html",
+    await flood_edit(e, "❌ Selection cancelled.", parse_mode="html",
                  buttons=None)
 
 
@@ -211,7 +211,7 @@ async def cb_sel_done(e):
                               alert=True)
     picked = [st["fresh"][i] for i in sorted(st["chosen"])]
     n_files = sum(len(t) for _, t, _ in picked)
-    await e.edit(
+    await flood_edit(e, 
         f"⏳ <b>Queue started</b> — {len(picked)} episode(s), "
         f"{n_files} file(s), one by one.\n\n"
         f"📩 Live progress panel is in the owner's DM.",
@@ -225,7 +225,7 @@ async def cb_sel_done(e):
                         "\n\n⚠️ Some episodes were skipped — usually "
                         "means no DB channel is set (/dbchannels) or "
                         "MongoDB was offline; see Koyeb logs.")
-                await e.respond(
+                await flood_respond(e, 
                     f"✅ <b>Batch done!</b> Posted {done}/{len(picked)} "
                     f"selected episode(s) — archived in the DB channel "
                     f"&amp; registered in MongoDB." + hint,
@@ -257,9 +257,10 @@ async def cmd_status(e):
             f" · every {st.get('interval', 20)} min\n"
             f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
             f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
-    m = await e.respond(head + autodl.job_panel(autodl.CURRENT),
-                        parse_mode="html",
-                        buttons=[Button.inline("🔄 Refresh", b"jrefresh")])
+    m = await flood_respond(e, head + autodl.job_panel(autodl.CURRENT),
+                            parse_mode="html",
+                            buttons=[Button.inline("🔄 Refresh",
+                                                   b"jrefresh")])
 
 
 
@@ -274,9 +275,10 @@ async def cb_jrefresh(e):
             f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
             f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
     try:
-        await e.edit(head + autodl.job_panel(autodl.CURRENT),
-                     parse_mode="html",
-                     buttons=[Button.inline("🔄 Refresh", b"jrefresh")])
+        await flood_edit(e, head + autodl.job_panel(autodl.CURRENT),
+                         parse_mode="html",
+                         buttons=[Button.inline("🔄 Refresh",
+                                                b"jrefresh")])
     except Exception:
         pass  # MessageNotModified = nothing changed, fine
     await e.answer("Refreshed")
@@ -287,15 +289,15 @@ async def cmd_cancel_job(e):
     """Owner-only: stop a running/queued AutoDL job."""
     from core import is_owner
     if not is_owner(e.sender_id):
-        return await e.respond("👑 Owner only.")
+        return await flood_respond(e, "👑 Owner only.")
     jid = e.pattern_match.group(1)
     job = autodl.JOBS.get(jid)
     if not job or job["status"] != "running":
-        return await e.respond(f"❓ No running job "
+        return await flood_respond(e, f"❓ No running job "
                                f"<code>{jid}</code>.",
                                parse_mode="html")
     job["cancel"] = True
-    await e.respond(f"🛑 Cancelling <code>{jid}</code> — the queue "
+    await flood_respond(e, f"🛑 Cancelling <code>{jid}</code> — the queue "
                     f"moves to the next file.", parse_mode="html")
 
 
@@ -348,16 +350,16 @@ async def cb_quality(e):
     await e.answer("📥 Sending…")
     got = await serve_file(e.sender_id, rec)
     if got:
-        await e.respond("📥 <b>File sent!</b> Check your DM 👇",
+        await flood_respond(e, "📥 <b>File sent!</b> Check your DM 👇",
                         parse_mode="html")
     else:
         link = rec.get("file_link")
         if link:
-            await e.respond(
+            await flood_respond(e, 
                 f"🔗 <b>File Store link:</b>\n"
                 f"{escape_html(link)}", parse_mode="html")
         else:
-            await e.respond("❌ File unavailable right now — "
+            await flood_respond(e, "❌ File unavailable right now — "
                             "ask an admin.", parse_mode="html")
 
 
@@ -410,7 +412,7 @@ async def cmd_searchad(e):
     arg = (e.pattern_match.group(1) or "").strip()
     name, ep = _sad_parse(arg)
     if not arg or not ep:
-        return await e.respond(
+        return await flood_respond(e, 
             "📌 Usage: <code>/searchad Name 09</code> — series name "
             "plus episode number. Checks the donghua AND anime API, "
             "lists every stream; picked ones are re-downloaded and "
@@ -423,10 +425,10 @@ async def cmd_searchad(e):
             found.append(sec)
             streams += [(sec, it, s) for s in it.get("streams", [])]
     if not streams:
-        return await e.respond(
+        return await flood_respond(e, 
             f"❌ Nothing found for <b>{escape_html(name)}</b> Ep {ep} "
             "in the donghua or anime API.", parse_mode="html")
-    msg = await e.respond(_sad_text(name, ep, streams, set()),
+    msg = await flood_respond(e, _sad_text(name, ep, streams, set()),
                           parse_mode="html",
                           buttons=_sad_buttons(streams, set()))
     SELAD[msg.id] = {"streams": streams, "chosen": set(),
@@ -444,7 +446,7 @@ async def cb_sad_toggle(e):
         st["chosen"].discard(i)
     else:
         st["chosen"].add(i)
-    await e.edit(_sad_text(st["name"], st["ep"], st["streams"],
+    await flood_edit(e, _sad_text(st["name"], st["ep"], st["streams"],
                            st["chosen"]),
                  parse_mode="html",
                  buttons=_sad_buttons(st["streams"], st["chosen"]))
@@ -453,7 +455,7 @@ async def cb_sad_toggle(e):
 @app.on(events.CallbackQuery(pattern=rb"sadcancel"))
 async def cb_sad_cancel(e):
     SELAD.pop(e.message_id, None)
-    await e.edit("❌ Search cancelled.", parse_mode="html",
+    await flood_edit(e, "❌ Search cancelled.", parse_mode="html",
                  buttons=None)
 
 
@@ -474,7 +476,7 @@ async def cb_sad_done(e):
                 picked[sec]["item"].get("streams", []))
                for sec in picked]
     n = sum(len(t) for _, t, _ in entries)
-    await e.edit(
+    await flood_edit(e, 
         f"⏳ <b>Force queue started</b> — {n} file(s) for "
         f"{escape_html(st['name'])} Ep {st['ep']} will be downloaded "
         "and uploaded again even though they may already be "

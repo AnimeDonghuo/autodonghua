@@ -379,3 +379,52 @@ def install_waiter_hook():
 def _now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------- #
+# FloodWait-safe replies
+# ---------------------------------------------------------------------- #
+_FLOOD = {}  # chat_id -> unix ts until which Telegram refuses sends
+
+
+def flood_left(chat_id) -> float:
+    return max(0.0, _FLOOD.get(chat_id, 0) - time.time())
+
+
+def flood_mark(chat_id, seconds) -> None:
+    _FLOOD[chat_id] = time.time() + seconds
+    print(f"[core] floodwait: chat {chat_id} blocked for {seconds}s")
+
+
+async def flood_respond(e, *args, **kwargs):
+    """e.respond() that survives FloodWaitError: the reply is
+    scheduled for right after the flood window instead of crashing
+    the handler with an unhandled traceback."""
+    from telethon.errors import FloodWaitError
+    try:
+        return await e.respond(*args, **kwargs)
+    except FloodWaitError as fw:
+        flood_mark(getattr(e, "chat_id", 0) or 0, fw.seconds)
+        asyncio.ensure_future(_late_call(e, "respond", fw.seconds,
+                                          args, kwargs))
+        return None
+
+
+async def flood_edit(e, *args, **kwargs):
+    """Same for e.edit() (callback queries)."""
+    from telethon.errors import FloodWaitError
+    try:
+        return await e.edit(*args, **kwargs)
+    except FloodWaitError as fw:
+        flood_mark(getattr(e, "chat_id", 0) or 0, fw.seconds)
+        asyncio.ensure_future(_late_call(e, "edit", fw.seconds,
+                                         args, kwargs))
+        return None
+
+
+async def _late_call(e, method, seconds, args, kwargs):
+    await asyncio.sleep(seconds + 10)
+    try:
+        await getattr(e, method)(*args, **kwargs)
+    except Exception as exc:
+        print(f"[core] delayed {method} failed:", repr(exc)[:160])

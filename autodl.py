@@ -26,6 +26,7 @@ import time
 
 import aiohttp
 from telethon.tl.custom import Button
+from telethon.errors import FloodWaitError
 
 from config import CONFIG, DOWNLOAD_DIR
 import core as core_mod
@@ -420,25 +421,47 @@ async def _owner_dm(text: str):
         print("[autodl] owner DM skipped — no owner/admin known "
                   "(send /setowner once)" )
         return None
+    oid = getattr(ent, "id", 0)
+    left = core_mod.flood_left(oid)
+    if left:  # mid-flood: deliver right after the window instead
+        asyncio.ensure_future(_delayed_owner_dm(oid, text, left + 5))
+        return None
     try:
         return await app.send_message(ent, text, parse_mode="html")
+    except FloodWaitError as fw:
+        core_mod.flood_mark(oid, fw.seconds)
+        asyncio.ensure_future(_delayed_owner_dm(oid, text,
+                                                fw.seconds + 5))
+        return None
     except Exception as exc:
         print("[autodl] owner DM failed:", exc)
         return None
 
 
+async def _delayed_owner_dm(oid, text, delay):
+    await asyncio.sleep(delay)
+    try:
+        await app.send_message(oid, text, parse_mode="html")
+    except Exception as exc:
+        print("[autodl] delayed owner DM failed:", repr(exc)[:160])
+
+
 async def _reporter(msg):
-    """Keep the owner-DM panel live while the batch runs."""
+    """Keep the owner-DM panel live while the batch runs — paced so
+    the panel itself can never flood the owner's chat."""
     last = None
     while True:
         text = job_panel(CURRENT)
-        if text != last:
+        cid = getattr(msg, "chat_id", 0) or 0
+        if text != last and not core_mod.flood_left(cid):
             try:
                 await msg.edit(text, parse_mode="html")
+                last = text
+            except FloodWaitError as fw:
+                core_mod.flood_mark(cid, fw.seconds)
             except Exception:
                 pass
-            last = text
-        await asyncio.sleep(3)
+        await asyncio.sleep(8)
 
 
 _HTTP = None
@@ -778,9 +801,10 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                             force_document=True)
                     break
                 except FloodWaitError as fw:
+                    core_mod.flood_mark(int(dbc), fw.seconds)
                     print(f"[autodl] archive floodwait {fw.seconds}s "
                           f"to {dbc} — sleeping it out")
-                    await asyncio.sleep(fw.seconds + 5)
+                    await asyncio.sleep(min(fw.seconds, 900) + 5)
                 except Exception as exc:
                     print(f"[autodl] archive try {attempt} failed to "
                           f"{dbc}: {exc}")
@@ -1086,6 +1110,7 @@ async def post_episode(group, ep, links, deeps, poster,
                 pass
             print(f"[autodl] posted {series} Ep {ep} "
                   f"[{ch['tag'] or 'indo'}] to {ch['id']}")
+            await asyncio.sleep(4)  # pace channel posts vs flood
         else:
             asyncio.ensure_future(_owner_dm(
                 f"❌ <b>Card post failed</b> — {series} Ep {ep} to "
@@ -1331,6 +1356,14 @@ async def _send_card(chat_id, poster, caption, buttons, fname,
                             "checked."))
             return sent
         except FloodWaitError as fw:
+            core_mod.flood_mark(chat_id, fw.seconds)
+            if fw.seconds > 300:
+                # an hours-long flood must NOT stall the batch: skip
+                # this card now, the repair/backlog pass retries it
+                print(f"[autodl] floodwait {fw.seconds}s to "
+                      f"{chat_id} — too long, card deferred to the "
+                      f"repair pass")
+                return None
             print(f"[autodl] floodwait {fw.seconds}s before posting "
                   f"to {chat_id} — sleeping it out")
             await asyncio.sleep(fw.seconds + 5)
@@ -1466,6 +1499,7 @@ async def process_group(group, force=False) -> bool:
                 asyncio.ensure_future(_owner_dm(
                     f"❌ <b>Job failed</b> — {series} Ep {ep} "
                     f"[{stream['quality']}]: {err}"))
+            await asyncio.sleep(2)  # smooth the batch send rate
 
         links = {}
         deeps = {}

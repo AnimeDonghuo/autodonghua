@@ -16,7 +16,7 @@ from telethon.tl.types import DocumentAttributeFilename, InputDocument
 from config import DOWNLOAD_DIR, THUMB_DIR
 from core import (AUTH, LOAD, PENDING, WAITERS, app, authed, bot_user,
                   image_bytes, is_staff, is_video_doc, now_key,
-                  save_thumb, store, url_bytes)
+                  save_thumb, store, url_bytes, flood_respond, flood_edit)
 from mediainfo_util import analyze, caption_lines, quality_label
 from parser import normalize_key, parse_filename
 from sources import build_metadata
@@ -135,7 +135,7 @@ async def on_file(e):
     if e.chat_id in WAITERS:
         return
     if not await is_staff(e.sender_id):
-        return await e.respond(RESTRICTED_MSG, parse_mode="html")
+        return await flood_respond(e, RESTRICTED_MSG, parse_mode="html")
 
     media_obj = e.video or e.document
     if not media_obj:
@@ -144,7 +144,7 @@ async def on_file(e):
         return  # ignore non-media documents in the auto flow
 
     if LOAD.locked():
-        return await e.respond(
+        return await flood_respond(e, 
             "⏳ <b>One file is being processed right now</b> — "
             "please wait a few seconds and send it again.\n\n"
             "<i>(free-tier instances process one file at a time)</i>",
@@ -155,7 +155,7 @@ async def on_file(e):
     status = None
     try:
         async with LOAD:
-            status = await e.respond(
+            status = await flood_respond(e, 
                 "🔄 <b>Processing your file…</b>\n"
                 "① <i>mediainfo quality scan…</i>", parse_mode="html")
 

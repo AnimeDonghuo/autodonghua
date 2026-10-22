@@ -9,7 +9,7 @@ from telethon import events
 
 from config import THUMB_DIR
 from core import (PENDING, app, forcesub_check, save_thumb,
-                  store, url_bytes, wait_for)
+                  store, url_bytes, wait_for, flood_respond, flood_edit)
 from handlers_files import (confirmation_text, markup,
                               send_pending, serve_file)
 from handlers_user import forcesub_gate
@@ -33,7 +33,7 @@ async def cb_toggle(e):
         p["selected"].discard(cid)
     else:
         p["selected"].add(cid)
-    await e.edit(confirmation_text(p),
+    await flood_edit(e, confirmation_text(p),
                    buttons=markup(key, _docs(p), p["selected"]),
                    parse_mode="html")
     await e.answer()
@@ -46,7 +46,7 @@ async def cb_select_all(e):
     if not p or p["user_id"] != e.sender_id:
         return await e.answer("⛔ Not your post", alert=True)
     p["selected"] = set(p["channels"])
-    await e.edit(confirmation_text(p),
+    await flood_edit(e, confirmation_text(p),
                    buttons=markup(key, _docs(p), p["selected"]),
                    parse_mode="html")
     await e.answer()
@@ -59,7 +59,7 @@ async def cb_custom_img(e):
     if not p or p["user_id"] != e.sender_id:
         return await e.answer("⛔ Not your post", alert=True)
     await e.answer("🖼 Send an image URL or upload a photo", alert=True)
-    await e.edit(confirmation_text(p)
+    await flood_edit(e, confirmation_text(p)
                    + "\n\n🖼 <b>Send an image URL or upload a photo "
                      "now…</b> (saved forever for this title)",
                    buttons=markup(key, _docs(p), p["selected"]),
@@ -132,10 +132,10 @@ async def cb_send(e):
     if not p["selected"]:
         return await e.answer("Select at least one channel first",
                                 alert=True)
-    await e.edit("📤 <b>Sending to selected channels…</b>",
+    await flood_edit(e, "📤 <b>Sending to selected channels…</b>",
                    parse_mode="html")
     text = await send_pending(p)
-    await e.edit(text, parse_mode="html")
+    await flood_edit(e, text, parse_mode="html")
     try:
         os.remove(p["path"])
     except Exception:
@@ -152,7 +152,7 @@ async def cb_cancel(e):
         os.remove(p["path"])
     except Exception:
         pass
-    await e.edit("❌ Post cancelled.", parse_mode="html")
+    await flood_edit(e, "❌ Post cancelled.", parse_mode="html")
 
 
 # ---------------------------------------------------------------------- #
@@ -163,7 +163,7 @@ async def cb_fs_check(e):
     from core import forcesub_check
     ok, _ = await forcesub_check(e.sender_id)
     if ok:
-        await e.edit("✅ <b>Verified!</b> You can now use "
+        await flood_edit(e, "✅ <b>Verified!</b> You can now use "
                        "/request & get files 🎉", parse_mode="html")
     else:
         await e.answer("❌ Not a member yet — join first", alert=True)
@@ -192,8 +192,8 @@ async def cb_getfile(e):
     await e.answer("📥 Sending to your DM…")
     got = await serve_file(e.sender_id, rec)
     if got:
-        await e.respond("📥 <b>File sent!</b> Check your downloads 👇",
+        await flood_respond(e, "📥 <b>File sent!</b> Check your downloads 👇",
                           parse_mode="html")
     else:
-        await e.respond("❌ File unavailable right now — ask an admin.",
+        await flood_respond(e, "❌ File unavailable right now — ask an admin.",
                           parse_mode="html")
