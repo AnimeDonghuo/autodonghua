@@ -36,7 +36,7 @@ from core import (LOAD, app, forcesub_check, invite_link,
                   store, url_bytes)
 from handlers_user import forcesub_gate
 from mediainfo_util import analyze, human_size
-from parser import normalize_key
+from parser import normalize_key, fuzzy_ratio
 from sources import build_metadata
 from style import escape_html, post_caption
 
@@ -93,11 +93,19 @@ async def fetch_latest(sections=None):
 
 
 def parse_api_title(title: str):
-    """'Wan Jie Du Zun 3rd Season Eps 218' -> (series, 218)"""
-    m = re.search(r"\s*[Ee]ps?\s*(\d{1,4})\s*$", (title or "").strip())
+    """'Wan Jie Du Zun 3rd Season Eps 218' -> (series, 218).
+    Tolerant: 'Ep/Episode/EP 20' and trailing tags after the number
+    ('[720p]', 'Eng', '(Sub)') no longer hide the episode — an item
+    must never fail the ep check just because its title carries
+    extras."""
+    t = (title or "").strip()
+    m = None
+    for mm in re.finditer(r"[Ee][Pp](?:s|isode)?\.?\s*(\d{1,4})(?!\d)",
+                          t):
+        m = mm  # last occurrence wins
     if m:
-        return title[:m.start()].strip(), int(m.group(1))
-    return (title or "").strip(), None
+        return t[:m.start()].strip(), int(m.group(1))
+    return t, None
 
 
 def quality_order(q: str) -> int:
@@ -1714,9 +1722,17 @@ async def _search_episode(section: str, series: str, ep):
     for item in await _fetch_one(
             f"{API_ROOT}/{section}/search?q={quote(q)}"):
         s, e2 = parse_api_title(item.get("title", ""))
-        if e2 == ep and normalize_key(s) == normalize_key(series):
-            item.setdefault("section", section)
-            return item
+        # BOTH checks: the episode number AND the name (fuzzy-
+        # tolerant, so a spelling variant never rejects a real hit)
+        ep_ok = e2 == int(ep) or (e2 is None and section == "donghua")
+        if not ep_ok:
+            continue
+        na, ns = normalize_key(s), normalize_key(series)
+        if not (na == ns or na in ns or ns in na
+                or fuzzy_ratio(s, series) >= 80):
+            continue
+        item.setdefault("section", section)
+        return item
     return None
 
 
