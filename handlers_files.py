@@ -17,7 +17,7 @@ from telethon.tl.types import DocumentAttributeFilename, InputDocument
 
 from config import DOWNLOAD_DIR, THUMB_DIR
 from core import (AUTH, LOAD, PENDING, WAITERS, app, authed,
-                  bot_user, fname_attrs,
+                  bot_user, fname_attrs, thumb_16x9,
                   image_bytes, is_staff, is_video_doc, now_key,
                   save_thumb, store, url_bytes, flood_respond, flood_edit)
 from mediainfo_util import analyze, caption_lines, quality_label
@@ -575,6 +575,18 @@ async def on_file(e):
         print("[file-flow] error:", err)
 
 
+def _thumb_bytes(p):
+    tb = p.get("thumb_bytes")
+    tp = p.get("thumb_path")
+    if not tb and tp:
+        try:
+            with open(tp, "rb") as fh:
+                tb = fh.read()
+        except Exception:
+            tb = None
+    return thumb_16x9(tb) if tb else None
+
+
 async def send_pending(p, status_msg=None):
     """Send the pending post to all selected channels, then store a
     copy in the TG DB channel."""
@@ -585,7 +597,7 @@ async def send_pending(p, status_msg=None):
         try:
             await app.send_file(
                 cid, file=p["media_obj"], caption=p["caption"],
-                thumb=p.get("thumb_bytes"),
+                thumb=_thumb_bytes(p),
                 supports_streaming=True, force_document=False)
             sent = True
         except Exception as ex:
@@ -595,7 +607,7 @@ async def send_pending(p, status_msg=None):
             try:
                 await app.send_file(
                     cid, file=p["path"], caption=p["caption"],
-                    thumb=p.get("thumb_path"),
+                    thumb=_thumb_bytes(p),
                     supports_streaming=True, force_document=False,
                     attributes=fname_attrs(p["caption"], p["path"]))
                 sent = True
@@ -613,7 +625,7 @@ async def send_pending(p, status_msg=None):
         try:
             sent_db = await app.send_file(
                 db_chan, file=p["media_obj"], caption=p["caption"],
-                thumb=p.get("thumb_bytes"),
+                thumb=_thumb_bytes(p),
                 supports_streaming=True, force_document=False)
             doc_obj = sent_db.document or sent_db.video
             db_info = {"channel": int(db_chan), "msg_id": sent_db.id,
@@ -622,7 +634,7 @@ async def send_pending(p, status_msg=None):
             try:  # re-upload fallback
                 sent_db = await app.send_file(
                     db_chan, file=p["path"], caption=p["caption"],
-                    thumb=p.get("thumb_path"),
+                    thumb=_thumb_bytes(p),
                     supports_streaming=True, force_document=False,
                     attributes=fname_attrs(p["caption"], p["path"]))
                 doc_obj = sent_db.document or sent_db.video

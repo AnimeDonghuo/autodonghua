@@ -27,6 +27,8 @@ import time
 import aiohttp
 from telethon.tl.custom import Button
 from telethon.errors import FloodWaitError
+from telethon import utils as tl_utils
+from telethon.tl.types import (DocumentAttributeVideo)
 
 from config import CONFIG, DOWNLOAD_DIR
 import core as core_mod
@@ -837,6 +839,14 @@ async def run_job(group, item, ep, stream, db_ids, poster):
         refs = []
         cap = (f"{series} — Ep {ep} [{q}] "
                f"{human_size(size)}")
+        # hachoir reads REAL duration/resolution from the file on
+        # disk (an InputFile object would yield the 0:00 1x1 dummy)
+        _va, _mime = tl_utils.get_attributes(path,
+                                             supports_streaming=True)
+        attrs = core_mod.fname_attrs(f"{series} Eps {ep:02d} [{q}]",
+                                     path) + [
+            x for x in _va if isinstance(x, DocumentAttributeVideo)]
+        thumb16 = core_mod.thumb_16x9(poster)
         primary = None  # first DB channel gets the real upload
         for dbc in db_ids:  # archive in every DB channel
             sent = None
@@ -850,9 +860,8 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                             progress_callback=up_cb)
                         sent = await app.send_file(
                             dbc, file=up, caption=cap,
-                            thumb=poster, supports_streaming=True,
-                            attributes=core_mod.fname_attrs(
-                                f"{series} Eps {ep:02d} [{q}]", path))
+                            thumb=thumb16, supports_streaming=True,
+                            attributes=attrs)
                     else:
                         # server-side copy: reuse the media Telegram
                         # already stores — zero re-upload, instant

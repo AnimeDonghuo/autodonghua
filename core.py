@@ -422,6 +422,41 @@ async def flood_edit(e, *args, **kwargs):
         return None
 
 
+_THUMB_CACHE = {}
+
+
+def thumb_16x9(data):
+    """Center-crop poster bytes to 16:9 so the video thumb fills the
+    player frame — no tall poster on a blank page. Falls back to the
+    original bytes if PIL is unavailable."""
+    if not data:
+        return data
+    import hashlib
+    key = hashlib.md5(data).hexdigest()
+    if key in _THUMB_CACHE:
+        return _THUMB_CACHE[key]
+    out = data
+    try:
+        import io as _io
+        from PIL import Image
+        img = Image.open(_io.BytesIO(data)).convert("RGB")
+        w, h = img.size
+        target = 16 / 9
+        if w / h > target:
+            nw = int(round(h * target))
+            box = ((w - nw) // 2, 0, (w - nw) // 2 + nw, h)
+        else:
+            nh = int(round(w / target))
+            box = (0, (h - nh) // 2, w, (h - nh) // 2 + nh)
+        buf = _io.BytesIO()
+        img.crop(box).save(buf, "JPEG", quality=85)
+        out = buf.getvalue()
+    except Exception as exc:
+        print("[core] 16:9 thumb crop failed:", repr(exc)[:100])
+    _THUMB_CACHE[key] = out
+    return out
+
+
 def fname_attrs(caption, path=None, default="video"):
     """DocumentAttributeFilename so the stored file carries the SAME
     name as the description written on the message. Telethon merges
