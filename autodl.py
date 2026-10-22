@@ -1139,7 +1139,6 @@ async def post_episode(group, ep, links, deeps, poster,
     except Exception:
         eng_syn = ""
     base_card = dict(
-        title=dual_title(series, meta),
         audio=_audio_lang(first_item),
         rating=(f"{first_item.get('rating')} / 10"
                 if first_item.get("rating") else ""),
@@ -1164,6 +1163,7 @@ async def post_episode(group, ep, links, deeps, poster,
             continue
         quals = sorted(kept, key=quality_order, reverse=True)
         cap_text, syn_off, syn_len = post_caption(
+            title=dual_title(series, meta) if ch["eng"] else series,
             episode_label=_episode_label([ep]),
             sub="Eng Sub" if ch["eng"] else "Indo-Sub",
             qualities=" | ".join(quals),
@@ -1345,7 +1345,6 @@ async def refresh_all_cards(gap=4) -> int:
                              or r["file_link"])
                          for q, r in kept.items()}
                 base_card = dict(
-                    title=dual_title(title, meta),
                     audio=_audio_lang(item),
                     rating=(f"{item.get('rating')} / 10"
                             if item.get("rating") else ""),
@@ -1354,6 +1353,7 @@ async def refresh_all_cards(gap=4) -> int:
                                               or [])[:5]),
                 )
                 cap_text, syn_off, syn_len = post_caption(
+                    title=dual_title(title, meta) if eng else title,
                     episode_label=_episode_label([ep]),
                     sub="Eng Sub" if eng else "Indo-Sub",
                     qualities=" | ".join(quals),
