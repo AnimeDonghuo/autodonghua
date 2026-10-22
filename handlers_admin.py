@@ -41,6 +41,7 @@ COMMAND_MENU = [
     ("recover", "Restore from a backup file"),
     ("addmongodb", "Add a MongoDB URI"),
     ("searchad", "Admin: force re-download any ep from the API"),
+    ("syncbutton", "Admin: sync card buttons + fetch late eng subs"),
     ("sync", "Sync bot command menu"),
     ("usage", "Storage & usage stats"),
 ]
