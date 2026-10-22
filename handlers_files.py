@@ -192,7 +192,8 @@ async def _fast_ingest(e, fname, series, ep, quality, media_obj):
         for dbc in db_ids:
             try:
                 sentm = await app.send_file(dbc, file=media_obj,
-                                            caption=cap)
+                                            caption=cap,
+                                            supports_streaming=True)
                 refs.append({
                     "channel": int(dbc), "msg_id": sentm.id,
                     "link": await autodl.file_link(dbc, sentm.id),
@@ -494,7 +495,7 @@ async def send_pending(p, status_msg=None):
             await app.send_file(
                 cid, file=p["media_obj"], caption=p["caption"],
                 thumb=p.get("thumb_bytes"),
-                force_document=False)
+                supports_streaming=True, force_document=False)
             sent = True
         except Exception as ex:
             err = str(ex)[:90]
@@ -504,7 +505,7 @@ async def send_pending(p, status_msg=None):
                 await app.send_file(
                     cid, file=p["path"], caption=p["caption"],
                     thumb=p.get("thumb_path"),
-                    force_document=False,
+                    supports_streaming=True, force_document=False,
                     attributes=fname_attrs(p["caption"], p["path"]))
                 sent = True
             except Exception as ex:
@@ -522,7 +523,7 @@ async def send_pending(p, status_msg=None):
             sent_db = await app.send_file(
                 db_chan, file=p["media_obj"], caption=p["caption"],
                 thumb=p.get("thumb_bytes"),
-                force_document=False)
+                supports_streaming=True, force_document=False)
             doc_obj = sent_db.document or sent_db.video
             db_info = {"channel": int(db_chan), "msg_id": sent_db.id,
                        "doc": _doc_ref(doc_obj)}
@@ -531,7 +532,7 @@ async def send_pending(p, status_msg=None):
                 sent_db = await app.send_file(
                     db_chan, file=p["path"], caption=p["caption"],
                     thumb=p.get("thumb_path"),
-                    force_document=False,
+                    supports_streaming=True, force_document=False,
                     attributes=fname_attrs(p["caption"], p["path"]))
                 doc_obj = sent_db.document or sent_db.video
                 db_info = {"channel": int(db_chan), "msg_id": sent_db.id,
@@ -579,7 +580,8 @@ async def serve_file(user_id: int, rec: dict):
                   .strip())
     try:
         await app.send_file(
-            user_id, file=media, caption=caption)
+            user_id, file=media, caption=caption,
+            supports_streaming=True)
         return True
     except Exception:
         pass
@@ -592,7 +594,8 @@ async def serve_file(user_id: int, rec: dict):
             m = await app.get_messages(extra["channel"],
                                        ids=extra["msg_id"])
             await app.send_file(
-                user_id, file=m.document or m.video, caption=caption)
+                user_id, file=m.document or m.video, caption=caption,
+                supports_streaming=True)
             return True
         except Exception:
             continue
