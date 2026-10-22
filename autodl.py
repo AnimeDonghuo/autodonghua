@@ -1156,10 +1156,15 @@ async def post_episode(group, ep, links, deeps, poster,
             pass
 
     posted = 0
+    topped = 0
     for ch in (only if only is not None else await posting_channels()):
         kept = {q: l for q, l in links.items()
                 if _has_eng(q) == ch["eng"]}
         if not kept:
+            print(f"[autodl] card skip: {series} Ep {ep} channel "
+                  f"{ch['id']} tag={ch['tag'] or '-'} needs "
+                  f"{'eng' if ch['eng'] else 'indo'} qualities, "
+                  f"links have {sorted(links)}")
             continue
         quals = sorted(kept, key=quality_order, reverse=True)
         cap_text, syn_off, syn_len = post_caption(
@@ -1174,15 +1179,41 @@ async def post_episode(group, ep, links, deeps, poster,
         ents = _card_entities(cap_text, syn_off, syn_len)
         doc = await find_post(norm, ep, ch["id"], ch["eng"])
         if doc:
-            # card already there: top up NEW quality buttons (e.g.
-            # the batch restarted mid-episode and the rest of the
-            # qualities landed later — the card must grow with them)
-            if set(quals) - set(doc.get("quals") or []):
-                await _apply_card_edit(
-                    doc, ch["id"], cap_text,
-                    _card_buttons(quals, deeps, doc["_id"]),
-                    ents, quals)
-            continue
+            alive = False
+            if doc.get("msg_id"):
+                try:
+                    alive = bool(await app.get_messages(
+                        ch["id"], ids=doc["msg_id"]))
+                except Exception:
+                    alive = False
+            if alive:
+                # card already there: top up NEW quality buttons
+                # (e.g. the batch restarted mid-episode and the rest
+                #  of the qualities landed later — it must grow)
+                new_q = set(quals) - set(doc.get("quals") or [])
+                if new_q:
+                    await _apply_card_edit(
+                        doc, ch["id"], cap_text,
+                        _card_buttons(quals, deeps, doc["_id"]),
+                        ents, quals)
+                    topped += 1
+                    print(f"[autodl] topped up {series} Ep {ep} "
+                          f"[{ch['tag'] or 'indo'}] in {ch['id']} "
+                          f"+{sorted(new_q)}")
+                else:
+                    print(f"[autodl] card already complete: "
+                          f"{series} Ep {ep} "
+                          f"[{ch['tag'] or 'indo'}] in {ch['id']}")
+                continue
+            # phantom doc: its message is gone from the channel —
+            # drop the stale record so a fresh card goes out
+            print(f"[autodl] stale posts doc {doc['_id']} (no live "
+                  f"message in {ch['id']}) — reposting")
+            try:
+                await store.col("posts").delete_one(
+                    {"_id": doc["_id"]})
+            except Exception:
+                pass
         pid = secrets.token_hex(4)
         await store.col("posts").update_one(
             {"_id": pid},
@@ -1213,7 +1244,7 @@ async def post_episode(group, ep, links, deeps, poster,
                 f"❌ <b>Card post failed</b> — {series} Ep {ep} to "
                 f"<code>{ch['id']}</code> — the repair pass will "
                 f"retry it"))
-    return posted
+    return posted + topped
 
 
 def _card_buttons(quals, deeps, pid):

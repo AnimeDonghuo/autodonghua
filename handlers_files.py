@@ -274,7 +274,7 @@ async def _run_flush(chat_id, msg, items, auto):
             posted = await autodl.post_episode(group, ep, links,
                                                deeps, poster)
             done.append(f"• <b>{escape_html(series)}</b> Ep {ep} "
-                        f"→ {posted} card(s)")
+                        f"→ {posted} card(s) posted/updated")
         except Exception as exc:
             failed.append(f"• {escape_html(series)} Ep {ep}: "
                           f"<code>{escape_html(str(exc)[:80])}"
