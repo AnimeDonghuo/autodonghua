@@ -11,7 +11,8 @@ from config import THUMB_DIR
 from core import (PENDING, app, forcesub_check, is_staff,
                   save_thumb,
                   store, url_bytes, wait_for, flood_respond, flood_edit)
-from handlers_files import (_fast_markup, confirmation_text,
+from handlers_files import (FAST_FLUSHING, _fast_markup,
+                            confirmation_text,
                             fast_batch_text, flush_batch, markup,
                               send_pending, serve_file)
 from handlers_user import forcesub_gate
@@ -196,6 +197,11 @@ async def cb_fast_batch(e):
         except Exception:
             pass
         return
+    if chat in FAST_FLUSHING:
+        return await e.answer(
+            "Already building posters & cards for this batch — "
+            "watch the status message, it shows each step.",
+            alert=True)
     await e.answer("Building posters & cards…")
     try:
         msg = await e.get_message()

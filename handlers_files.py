@@ -51,6 +51,7 @@ def _fast_filename(fname: str):
 
 
 FAST_BATCH = {}   # chat_id -> {"items": {(norm, ep): {...}}, ...}
+FAST_FLUSHING = set()  # chats whose Done build is running
 FAST_LOCK = asyncio.Lock()
 FAST_AUTO_SECONDS = 15 * 60
 
@@ -206,53 +207,78 @@ async def flush_batch(chat_id: int, msg=None, auto: bool = False):
                 {"_id": int(chat_id)})
         except Exception:
             pass
-        if msg:
-            try:
-                await flood_edit(msg, "🎬 <b>Building posters & "
-                                      "cards…</b>", parse_mode="html")
-            except Exception:
-                pass
-        done, failed = [], []
-        for (norm, ep), it in sorted(items.items(),
-                                     key=lambda kv: kv[0][1]):
-            series = it["series"]
-            try:
-                item = None
+        FAST_FLUSHING.add(chat_id)
+        try:
+            return await _run_flush(chat_id, msg, items, auto)
+        finally:
+            FAST_FLUSHING.discard(chat_id)
+
+
+async def _run_flush(chat_id, msg, items, auto):
+    import autodl
+    done, failed = [], []
+    todo = sorted(items.items(), key=lambda kv: kv[0][1])
+    for idx, ((norm, ep), it) in enumerate(todo, 1):
+        series = it["series"]
+        step = f"{idx}/{len(todo)} — <b>{escape_html(series)}</b> Ep {ep}"
+        try:
+            if msg:
+                await flood_edit(msg, f"🎬 <b>Building posters & "
+                                      f"cards…</b> {step}: "
+                                      f"🔍 searching API…",
+                                 parse_mode="html")
+
+            async def _find():
                 for sec in ("donghua", "anime"):
-                    item = await autodl._search_episode(sec, series,
-                                                        ep)
-                    if item:
-                        break
-                item = item or {"id": 0,
-                                "title": f"{series} Eps {ep:02d}",
-                                "series": series, "type": "donghua",
-                                "genres": [], "rating": None,
-                                "description": "",
-                                "section": "donghua"}
-                poster, _src = await autodl.resolve_poster(item,
-                                                           series)
+                    found = await autodl._search_episode(sec, series,
+                                                         ep)
+                    if found:
+                        return found
+                return None
+            try:  # never hang the whole build on a slow API
+                item = await asyncio.wait_for(_find(), 30)
+            except Exception:
+                item = None
+            item = item or {"id": 0,
+                            "title": f"{series} Eps {ep:02d}",
+                            "series": series, "type": "donghua",
+                            "genres": [], "rating": None,
+                            "description": "",
+                            "section": "donghua"}
+            if msg:
+                await flood_edit(msg, f"🎬 <b>Building posters & "
+                                      f"cards…</b> {step}: "
+                                      f"🖼 poster…",
+                                 parse_mode="html")
+            poster, _src = await autodl.resolve_poster(item,
+                                                       series)
+            if msg:
+                await flood_edit(msg, f"🎬 <b>Building posters & "
+                                      f"cards…</b> {step}: "
+                                      f"📺 posting cards…",
+                                 parse_mode="html")
                 recs = [r for r in await store.find(
-                    "downloaded", {"norm_title": norm, "episode": ep})
-                    if r.get("file_link")]
-                links = {r["quality"]: r["file_link"] for r in recs}
-                deeps = {r["quality"]: (r.get("deep_link")
-                                        or await
-                                        autodl.ensure_deep_link(
-                                            autodl._key(norm, ep,
-                                                        r["quality"]))
-                                        or r["file_link"])
-                         for r in recs}
-                group = {"series": series, "norm": norm,
-                         "entries": [(item, [],
-                                      item.get("streams", []))]}
-                posted = await autodl.post_episode(group, ep, links,
-                                                   deeps, poster)
-                done.append(f"• <b>{escape_html(series)}</b> Ep {ep} "
-                            f"→ {posted} card(s)")
-            except Exception as exc:
-                failed.append(f"• {escape_html(series)} Ep {ep}: "
-                              f"<code>{escape_html(str(exc)[:80])}"
-                              f"</code>")
+                "downloaded", {"norm_title": norm, "episode": ep})
+                if r.get("file_link")]
+            links = {r["quality"]: r["file_link"] for r in recs}
+            deeps = {r["quality"]: (r.get("deep_link")
+                                    or await
+                                    autodl.ensure_deep_link(
+                                        autodl._key(norm, ep,
+                                                    r["quality"]))
+                                    or r["file_link"])
+                     for r in recs}
+            group = {"series": series, "norm": norm,
+                     "entries": [(item, [],
+                                  item.get("streams", []))]}
+            posted = await autodl.post_episode(group, ep, links,
+                                               deeps, poster)
+            done.append(f"• <b>{escape_html(series)}</b> Ep {ep} "
+                        f"→ {posted} card(s)")
+        except Exception as exc:
+            failed.append(f"• {escape_html(series)} Ep {ep}: "
+                          f"<code>{escape_html(str(exc)[:80])}"
+                          f"</code>")
     txt = (("⏰ <b>Auto-finish</b> (batch was idle) — " if auto else
             "🎬 <b>Batch finished</b> — ") +
            "posters & episode cards:\n\n" +
