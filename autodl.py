@@ -646,6 +646,26 @@ def pick_eng_synopsis(meta, indo_syn: str) -> str:
     return syn
 
 
+def _eng_title(meta) -> str:
+    bs = (meta or {}).get("by_source") or {}
+    for src in ("anilist", "jikan"):
+        r = bs.get(src)
+        t = (getattr(r, "title", "") or "").strip()
+        if t:
+            return t
+    return ""
+
+
+def dual_title(series: str, meta=None) -> str:
+    """Poster title in the user's format: the actual name first,
+    then the english version divided by | — e.g.
+    'Shixiong A Shixiong: Zuizhong Ji | Big Brother'."""
+    eng = _eng_title(meta)
+    if eng and eng.lower() != (series or "").strip().lower():
+        return f"{series} | {eng}"
+    return series
+
+
 def _audio_lang(item) -> str:
     kind = str(item.get("type") or item.get("section") or "").lower()
     return "Chinese" if kind == "donghua" else "Japanese"
@@ -1112,13 +1132,14 @@ async def post_episode(group, ep, links, deeps, poster,
     # channels, English (AniList/Jikan) for eng-tagged ones
     indo_syn = _clean_synopsis(first_item.get("description") or "")
     eng_syn = ""
+    meta = None
     try:
         meta = await build_metadata(series)
         eng_syn = pick_eng_synopsis(meta, indo_syn)
     except Exception:
         eng_syn = ""
     base_card = dict(
-        title=series,
+        title=dual_title(series, meta),
         audio=_audio_lang(first_item),
         rating=(f"{first_item.get('rating')} / 10"
                 if first_item.get("rating") else ""),
@@ -1219,6 +1240,7 @@ async def _channel_card_map(channel, cache, limit=600):
             if not m.photo or not cap:
                 continue
             first = cap.split("\n", 1)[0].strip()
+            first = first.split(" | ", 1)[0].strip()
             mm = re.search("‣ Episode ⌯ (.+)", cap)
             if mm:
                 mp[(first, mm.group(1).strip())] = m.id
@@ -1310,19 +1332,20 @@ async def refresh_all_cards(gap=4) -> int:
                 indo_syn = _clean_synopsis(item.get("description")
                                            or "")
                 eng_syn = ""
-                if eng:
-                    try:
-                        meta = await build_metadata(title)
+                meta = None
+                try:
+                    meta = await build_metadata(title)
+                    if eng:
                         eng_syn = pick_eng_synopsis(meta, indo_syn)
-                    except Exception:
-                        eng_syn = ""
+                except Exception:
+                    eng_syn = ""
                 deeps = {q: (r.get("deep_link")
                              or await ensure_deep_link(
                                  _key(norm, ep, q))
                              or r["file_link"])
                          for q, r in kept.items()}
                 base_card = dict(
-                    title=title,
+                    title=dual_title(title, meta),
                     audio=_audio_lang(item),
                     rating=(f"{item.get('rating')} / 10"
                             if item.get("rating") else ""),

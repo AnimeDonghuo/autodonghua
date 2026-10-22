@@ -201,7 +201,13 @@ async def cb_fast_batch(e):
         msg = await e.get_message()
     except Exception:
         msg = None
-    await flush_batch(chat, msg)
+    n = await flush_batch(chat, msg)
+    if not n:
+        await e.answer(
+            "No pending batch reached this instance (memory + DB "
+            "both empty). If Koyeb is still draining an old "
+            "instance, re-send the files once — the new build "
+            "persists batches in Mongo.", alert=True)
 
 
 @app.on(events.CallbackQuery(pattern=rb"getfile:(.+)"))

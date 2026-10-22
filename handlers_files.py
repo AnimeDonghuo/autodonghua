@@ -72,6 +72,14 @@ async def _persist_batch(chat_id: int):
                       "msg_id": b["msg"].id if b.get("msg") else None,
                       "updated": time.time()}},
             upsert=True)
+        try:
+            chk = await store.find("fast_batch", {"_id": int(chat_id)})
+            n = len((chk or [{}])[0].get("items") or {}) if chk else 0
+            print(f"[file-flow] batch persisted chat={chat_id} "
+                  f"items={len(items)} readback={n}")
+        except Exception as exc2:
+            print("[file-flow] batch readback failed:",
+                  repr(exc2)[:100])
     except Exception as exc:
         print("[file-flow] batch persist failed:", repr(exc)[:120])
 
@@ -173,8 +181,12 @@ async def flush_batch(chat_id: int, msg=None, auto: bool = False):
         if b and b.get("timer"):
             b["timer"].cancel()
         items = dict(b["items"]) if b and b["items"] else {}
+        print(f"[file-flow] flush chat={chat_id} "
+              f"memory_items={len(items)}")
         if not items:  # restart happened? the DB copy survives it
             items, msg_id = await _load_persisted(chat_id)
+            print(f"[file-flow] flush chat={chat_id} "
+                  f"db_items={len(items)}")
             if not msg and msg_id:
                 try:
                     msg = await app.get_messages(chat_id, ids=msg_id)

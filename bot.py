@@ -20,6 +20,8 @@ async def main():
         print("=" * 60)
         sys.exit(1)
 
+    import time as _t
+    print(f"[boot] instance started at {_t.time():.0f} (epoch)")
     print("🔌 Connecting storage backend…")
     await core.store.init()
     await core.load_auth()
