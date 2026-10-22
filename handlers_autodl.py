@@ -261,6 +261,8 @@ async def cmd_status(e):
                             parse_mode="html",
                             buttons=[Button.inline("🔄 Refresh",
                                                    b"jrefresh")])
+    if m is not None:  # THIS message becomes the one live panel;
+        await autodl.set_live_panel(m.chat_id, m.id)  # old one dies
 
 
 
@@ -279,6 +281,7 @@ async def cb_jrefresh(e):
                          parse_mode="html",
                          buttons=[Button.inline("🔄 Refresh",
                                                 b"jrefresh")])
+        await autodl.set_live_panel(e.chat_id, e.message_id)
     except Exception:
         pass  # MessageNotModified = nothing changed, fine
     await e.answer("Refreshed")
@@ -490,3 +493,31 @@ async def cb_sad_done(e):
         except Exception as exc:
             print("[autodl] searchad batch failed:", repr(exc)[:200])
     asyncio.ensure_future(_run())
+
+
+@app.on(events.NewMessage(pattern=r"^/syncbutton(?:\s|$)"))
+async def cmd_syncbutton(e):
+    """Staff: after the in-flight episode/batch completes, sweep every
+    channel card — top up missing quality buttons, and for indo cards
+    whose eng sub has since landed on the search API, download and
+    upload it now. Queue is paused while the sweep runs."""
+    if not await require_staff(e):
+        return
+    if autodl.LOAD.locked():
+        autodl.SYNC_REQ["on"] = True
+        return await flood_respond(
+            e, "🔄 <b>Sync queued</b> — the episode currently "
+               "downloading will finish all its qualities first, "
+               "then every card's buttons get topped up and missing "
+               "eng subs are fetched from the search API. Summary "
+               "lands in your DM.", parse_mode="html")
+
+    async def _run():
+        async with autodl.LOAD:
+            await autodl.sync_buttons_pass()
+    asyncio.ensure_future(_run())
+    await flood_respond(
+        e, "🔄 <b>Sync started</b> — checking every channel card "
+           "against the DB, topping up quality buttons and fetching "
+           "any eng sub the search API now offers. Summary lands in "
+           "your DM.", parse_mode="html")

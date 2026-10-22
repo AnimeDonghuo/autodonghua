@@ -46,6 +46,7 @@ async def main():
           f"archived file(s)")
     asyncio.ensure_future(autodl.autodl_loop())
     asyncio.ensure_future(autodl.eng_pending_loop())
+    asyncio.ensure_future(autodl.panel_loop())
     print(autodl.telethon_info() + " · build " + autodl.BUILD)
 
     async def _resume_batch():

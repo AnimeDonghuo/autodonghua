@@ -25,7 +25,7 @@ from telethon.network import ConnectionTcpAbridged
 app = TelegramClient("autodonghua_bot", CONFIG.get("api_id"),
                      CONFIG.get("api_hash"),
                      connection=ConnectionTcpAbridged,
-                     flood_sleep_threshold=120)
+                     flood_sleep_threshold=60)
 
 bot_user = None  # set at startup (our own bot account)
 

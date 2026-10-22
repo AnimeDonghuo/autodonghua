@@ -45,7 +45,7 @@ DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
 # The free API host sleeps when idle: the first call can 502 or
 # hang while it wakes, so every read is retried with backoff.
-API_RETRY_DELAYS = (3, 10, 30)
+API_RETRY_DELAYS = (2, 8, 20)
 MIN_FREE_DISK = 150 * 1024 * 1024  # keep a safety margin
 
 
@@ -70,10 +70,18 @@ async def _fetch_one(url: str):
 
 
 async def fetch_latest(sections=None):
-    """Every listed episode of the watched sections (donghua/anime)."""
+    """Every listed episode of the watched sections (donghua/anime),
+    fetched IN PARALLEL so the watcher/handlers feel snappier."""
+    secs = list(sections or DEFAULT_SECTIONS)
+    res = await asyncio.gather(
+        *[_fetch_one(f"{API_ROOT}/{s}/videos") for s in secs],
+        return_exceptions=True)
     out, seen = [], set()
-    for sec in (sections or DEFAULT_SECTIONS):
-        for item in await _fetch_one(f"{API_ROOT}/{sec}/videos"):
+    for sec, items in zip(secs, res):
+        if isinstance(items, BaseException):
+            print(f"[autodl] section {sec} fetch failed: {items}")
+            items = []
+        for item in items:
             if item.get("id") in seen:
                 continue
             seen.add(item.get("id"))
@@ -447,21 +455,52 @@ async def _delayed_owner_dm(oid, text, delay):
 
 
 async def _reporter(msg):
-    """Keep the owner-DM panel live while the batch runs — paced so
-    the panel itself can never flood the owner's chat."""
+    """Legacy no-op keeper — the live panel is driven by panel_loop()
+    against PANEL so /status and the batch panel are ONE message."""
+    return
+
+
+# The ONE live progress panel: batch start and /status both point it
+# at their message; the old one is deleted so only the newest panel
+# ever keeps updating.
+PANEL = {"chat": None, "id": None}
+SYNC_REQ = {"on": False}  # /syncbutton: run full sync at batch end
+
+
+async def set_live_panel(chat_id, msg_id) -> None:
+    old = (PANEL["chat"], PANEL["id"])
+    PANEL["chat"], PANEL["id"] = chat_id, msg_id
+    if old[0] and old != (chat_id, msg_id):
+        try:
+            await app.delete_messages(old[0], [old[1]])
+            print(f"[autodl] old live panel {old} deleted")
+        except Exception:
+            pass
+
+
+async def panel_loop():
+    """Keeps whichever message is the live panel updated (batch or
+    manual /status), paced and flood-aware."""
     last = None
     while True:
-        text = job_panel(CURRENT)
-        cid = getattr(msg, "chat_id", 0) or 0
-        if text != last and not core_mod.flood_left(cid):
-            try:
-                await msg.edit(text, parse_mode="html")
-                last = text
-            except FloodWaitError as fw:
-                core_mod.flood_mark(cid, fw.seconds)
-            except Exception:
-                pass
-        await asyncio.sleep(8)
+        try:
+            chat, mid = PANEL["chat"], PANEL["id"]
+            if chat:
+                text = job_panel(CURRENT)
+                if text != last:
+                    try:
+                        await app.edit_message(chat, mid, text,
+                                               parse_mode="html")
+                        last = text
+                    except FloodWaitError as fw:
+                        core_mod.flood_mark(chat, fw.seconds)
+                    except Exception:
+                        pass
+            else:
+                last = None
+        except Exception as exc:
+            print("[autodl] panel loop error:", repr(exc)[:160])
+        await asyncio.sleep(6)
 
 
 _HTTP = None
@@ -615,17 +654,26 @@ def _episode_label(eps) -> str:
     return f"{lo:02d}" if lo == hi else f"{lo:02d} To {hi:02d}"
 
 
+_NET_CACHE = {}  # chat_id -> (ts, line): rarely changes
+
+
 async def _network_line(chat_id) -> str:
+    hit = _NET_CACHE.get(chat_id)
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    line = ""
     try:
         ent = await app.get_entity(chat_id)
         if getattr(ent, "username", None):
-            return f"🔗 𝗢𝘂𝗿 𝗡𝗲𝘁𝘄𝗼𝗿𝗸 @{ent.username}"
-        link = await invite_link(chat_id)
-        if link:
-            return f"🔗 𝗢𝘂𝗿 𝗡𝗲𝘁𝘄𝗼𝗿𝗸 {link}"
+            line = f"🔗 𝗢𝘂𝗿 𝗡𝗲𝘁𝘄𝗼𝗿𝗸 @{ent.username}"
+        else:
+            link = await invite_link(chat_id)
+            if link:
+                line = f"🔗 𝗢𝘂𝗿 𝗡𝗲𝘁𝘄𝗼𝗿𝗸 {link}"
     except Exception:
         pass
-    return ""
+    _NET_CACHE[chat_id] = (time.time(), line)
+    return line
 
 
 def _streams_for(item, qualities):
@@ -713,7 +761,12 @@ def group_fresh(fresh):
     for g in groups.values():
         g["entries"].sort(key=lambda t: parse_api_title(
             t[0].get("title", ""))[1] or 0)
-    return list(groups.values())
+    out = list(groups.values())
+    for g in out:
+        g["section"] = g["entries"][0][0].get("section") or ""
+    # donghua jumps the queue ahead of anime (eng channel priority)
+    out.sort(key=lambda g: 0 if g.get("section") == "donghua" else 1)
+    return out
 
 
 def _free_up(need_mb=900):
@@ -909,24 +962,24 @@ async def run_batch(fresh, force=False):
                          for g in groups
                          for _, todo, _ in g["entries"])
     msg = await _owner_dm(job_panel(None))
-    reporter = (asyncio.ensure_future(_reporter(msg))
-                if msg else None)
+    if msg is not None:
+        await set_live_panel(getattr(msg, "chat_id", None),
+                             getattr(msg, "id", None))
     done = 0
     try:
         for g in groups:
             if await process_group(g, force=force):
                 done += 1
     finally:
-        if reporter:
-            reporter.cancel()
         ok = sum(1 for j in JOBS.values() if j["status"] == "done")
         bad = sum(1 for j in JOBS.values() if j["status"] == "failed")
         can = sum(1 for j in JOBS.values()
                   if j["status"] == "cancelled")
-        if msg:
+        if PANEL["chat"]:
             cpu, ram, total = container_stats()
             try:
-                await msg.edit(
+                await app.edit_message(
+                    PANEL["chat"], PANEL["id"],
                     f"✅ <b>Batch finished</b>\n\n"
                     f"⬇️ archived: <b>{ok}</b> · ❌ failed: <b>{bad}</b>"
                     f" · 🛑 cancelled: <b>{can}</b>\n"
@@ -940,6 +993,7 @@ async def run_batch(fresh, force=False):
                     parse_mode="html")
             except Exception:
                 pass
+            PANEL["chat"] = PANEL["id"] = None  # freeze the summary
         try:
             await repair_posts()
         except Exception as exc:
@@ -952,6 +1006,13 @@ async def run_batch(fresh, force=False):
         except Exception as exc:
             print("[autodl] card refresh pass failed:",
                   repr(exc)[:200])
+        if SYNC_REQ["on"]:  # /syncbutton: full sweep after the batch
+            SYNC_REQ["on"] = False
+            try:
+                await sync_buttons_pass()
+            except Exception as exc:
+                print("[autodl] syncbutton pass failed:",
+                      repr(exc)[:200])
         await store.set_config("pending_batch", None)
         JOBS.clear()
         BATCH["n"] = BATCH["total"] = 0
@@ -1624,6 +1685,67 @@ async def _eng_pending_pass(st) -> int:
             done += 1
         await asyncio.sleep(10)
     return done
+
+
+async def sync_buttons_pass(notify=True):
+    """The /syncbutton sweep (call with LOAD held): 1) top up every
+    card whose episode has more archived qualities than its buttons,
+    2) for every indo card whose eng sub was missing, ask the search
+    API — if eng landed, download+upload it now; otherwise remember
+    it in eng_pending so the watcher keeps watching."""
+    st = await get_settings()
+    topped = await refresh_all_cards(gap=4)
+    entries = []
+    seen = set()
+    for doc in await store.find("posts", {}):
+        if doc.get("eng"):
+            continue  # eng cards need no eng sweep
+        norm = doc.get("norm")
+        title = doc.get("title") or ""
+        for ep in doc.get("eps") or []:
+            key = (norm, ep)
+            if key in seen:
+                continue
+            seen.add(key)
+            if await _registry_has_eng(norm, ep):
+                continue
+            section = doc.get("section") or "donghua"
+            item = await _search_episode(section, title, ep)
+            if item is None and section == "donghua":
+                item = await _search_episode("anime", title, ep)
+                section = "anime" if item else section
+            if item is None:
+                await pending_eng_add(section, title, norm, ep)
+                continue
+            wanted = wanted_streams(item.get("streams", []),
+                                    st["qualities"], False, True)
+            missing = [s for s in wanted
+                       if not already_downloaded(norm, ep,
+                                                 s.get("quality", ""))]
+            if not missing:
+                await pending_eng_add(section, title, norm, ep)
+                continue
+            entries.append((item, missing,
+                            wanted_streams(item.get("streams", []),
+                                           st["qualities"],
+                                           True, True)))
+            if len(entries) >= 20:
+                break
+    downloaded = 0
+    if entries:
+        downloaded = await run_batch(entries)  # LOAD already held
+    if notify:
+        await _owner_dm(
+            f"🔄 <b>Sync-button pass done</b>\n\n"
+            f"🃏 cards topped up with missing quality buttons: "
+            f"<b>{topped}</b>\n"
+            f"🌐 eng subs fetched from the search API: "
+            f"<b>{len(entries)}</b> episode(s), {downloaded} posted\n"
+            f"⏳ still waiting on eng (watcher will keep checking): "
+            f"the rest of your indo cards")
+    print(f"[autodl] syncbutton: topped={topped} eng_entries="
+          f"{len(entries)}")
+    return topped, len(entries)
 
 
 async def eng_pending_loop():
