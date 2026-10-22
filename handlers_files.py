@@ -55,6 +55,74 @@ FAST_LOCK = asyncio.Lock()
 FAST_AUTO_SECONDS = 15 * 60
 
 
+async def _persist_batch(chat_id: int):
+    """Survive restarts/redeploys: the pending batch lives in Mongo
+    too, so ✅ Done still works after Koyeb recycles the instance."""
+    b = FAST_BATCH.get(chat_id)
+    if not b:
+        return
+    items = {f"{n}|{ep}": {"series": it["series"],
+                           "quals": sorted(it["quals"]),
+                           "count": it["count"]}
+             for (n, ep), it in b["items"].items()}
+    try:
+        await store.col("fast_batch").update_one(
+            {"_id": int(chat_id)},
+            {"$set": {"items": items,
+                      "msg_id": b["msg"].id if b.get("msg") else None,
+                      "updated": time.time()}},
+            upsert=True)
+    except Exception as exc:
+        print("[file-flow] batch persist failed:", repr(exc)[:120])
+
+
+async def _load_persisted(chat_id: int):
+    """{(norm, ep): item} from the DB copy of the batch, or {}."""
+    try:
+        docs = await store.find("fast_batch", {"_id": int(chat_id)})
+    except Exception:
+        return {}, None
+    if not docs:
+        return {}, None
+    d = docs[0]
+    items = {}
+    for key, it in (d.get("items") or {}).items():
+        n, _, ep = key.partition("|")
+        items[(n, int(ep))] = {"series": it.get("series", n),
+                               "quals": set(it.get("quals") or []),
+                               "count": it.get("count", 1)}
+    return items, d.get("msg_id")
+
+
+async def restore_fast_batches():
+    """Boot: re-arm every batch that survived a restart."""
+    try:
+        docs = await store.find("fast_batch")
+    except Exception:
+        return
+    for d in docs or []:
+        chat = d.get("_id")
+        items, msg_id = await _load_persisted(chat)
+        if not items:
+            try:
+                await store.col("fast_batch").delete_one(
+                    {"_id": chat})
+            except Exception:
+                pass
+            continue
+        msg = None
+        if msg_id:
+            try:
+                msg = await app.get_messages(chat, ids=msg_id)
+            except Exception:
+                msg = None
+        FAST_BATCH[chat] = {"items": items, "timer": None,
+                            "msg": msg}
+        await _arm_auto_flush(chat)
+        print(f"[file-flow] restored pending batch for {chat}: "
+              f"{len(items)} episode(s)")
+
+
 def _fast_markup(chat_id: int) -> list:
     return [[Button.inline("➕ Add more",
                            f"fast:more:{chat_id}".encode())],
@@ -102,16 +170,38 @@ async def flush_batch(chat_id: int, msg=None, auto: bool = False):
     import autodl
     async with FAST_LOCK:
         b = FAST_BATCH.pop(chat_id, None)
-        if not b or not b["items"]:
+        if b and b.get("timer"):
+            b["timer"].cancel()
+        items = dict(b["items"]) if b and b["items"] else {}
+        if not items:  # restart happened? the DB copy survives it
+            items, msg_id = await _load_persisted(chat_id)
+            if not msg and msg_id:
+                try:
+                    msg = await app.get_messages(chat_id, ids=msg_id)
+                except Exception:
+                    msg = None
+        if not items:
             if msg:
                 try:
                     await flood_edit(msg, "📥 <b>Batch empty</b> — "
-                                          "nothing to finish.")
+                                          "nothing to finish.",
+                                     parse_mode="html")
                 except Exception:
                     pass
             return 0
+        try:
+            await store.col("fast_batch").delete_one(
+                {"_id": int(chat_id)})
+        except Exception:
+            pass
+        if msg:
+            try:
+                await flood_edit(msg, "🎬 <b>Building posters & "
+                                      "cards…</b>", parse_mode="html")
+            except Exception:
+                pass
         done, failed = [], []
-        for (norm, ep), it in sorted(b["items"].items(),
+        for (norm, ep), it in sorted(items.items(),
                                      key=lambda kv: kv[0][1]):
             series = it["series"]
             try:
@@ -221,6 +311,7 @@ async def _fast_ingest(e, fname, series, ep, quality, media_obj):
         it["quals"].add(quality)
         it["count"] += 1
         b["msg"] = status
+        await _persist_batch(e.chat_id)
         await _arm_auto_flush(e.chat_id)
         if status:
             await flood_edit(status, fast_batch_text(e.chat_id),

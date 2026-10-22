@@ -45,6 +45,7 @@ async def main():
     print(f"📥 AutoDL registry: {await autodl.registry_size()} "
           f"archived file(s)")
     asyncio.ensure_future(autodl.autodl_loop())
+    asyncio.ensure_future(handlers_files.restore_fast_batches())
     asyncio.ensure_future(autodl.eng_pending_loop())
     asyncio.ensure_future(autodl.panel_loop())
     print(autodl.telethon_info() + " · build " + autodl.BUILD)
