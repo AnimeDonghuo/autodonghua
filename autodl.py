@@ -850,14 +850,12 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                             progress_callback=up_cb)
                         sent = await app.send_file(
                             dbc, file=up, caption=cap,
-                            thumb=poster, supports_streaming=True,
-                            force_document=True)
+                            thumb=poster, supports_streaming=True)
                     else:
                         # server-side copy: reuse the media Telegram
                         # already stores — zero re-upload, instant
                         sent = await app.send_file(
-                            dbc, file=primary.media, caption=cap,
-                            force_document=True)
+                            dbc, file=primary.media, caption=cap)
                     break
                 except FloodWaitError as fw:
                     core_mod.flood_mark(int(dbc), fw.seconds)

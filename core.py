@@ -422,6 +422,27 @@ async def flood_edit(e, *args, **kwargs):
         return None
 
 
+async def flood_send_file(e, *args, **kwargs):
+    """send_file into the event's chat, FloodWait-safe (the backup
+    flow used respond(file=, caption=) which send_message rejects)."""
+    from telethon.errors import FloodWaitError
+    try:
+        return await e.client.send_file(e.chat_id, *args, **kwargs)
+    except FloodWaitError as fw:
+        flood_mark(e.chat_id or 0, fw.seconds)
+        asyncio.ensure_future(_late_send_file(e, fw.seconds, args,
+                                              kwargs))
+        return None
+
+
+async def _late_send_file(e, seconds, args, kwargs):
+    await asyncio.sleep(seconds + 10)
+    try:
+        await e.client.send_file(e.chat_id, *args, **kwargs)
+    except Exception as exc:
+        print("[core] delayed send_file failed:", repr(exc)[:160])
+
+
 async def _late_call(e, method, seconds, args, kwargs):
     await asyncio.sleep(seconds + 10)
     try:

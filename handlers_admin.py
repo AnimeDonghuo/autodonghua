@@ -25,7 +25,7 @@ from backup import backup_filename, backup_summary, load_backup, write_backup
 from config import BACKUP_DIR, CONFIG, save_config
 from core import (app, get_pass, is_owner, login, logout,
                   require_staff, resolve_channel, store, wait_for,
-                  flood_respond, flood_edit)
+                  flood_respond, flood_edit, flood_send_file)
 from parser import normalize_key
 from style import ADMIN_HOME, escape_html
 
@@ -335,10 +335,11 @@ async def cmd_backup(e):
         except Exception as ex:
             sent.append(f"db channel failed ({ex})")
     try:
-        await flood_respond(e, file=path,
-                        caption=caption + "\n\n📌 Keep this file safe — use "
-                                "/recover to restore everything from it.",
-                        parse_mode="html")
+        await flood_send_file(
+            e, path,
+            caption=caption + "\n\n📌 Keep this file safe — use "
+                    "/recover to restore everything from it.",
+            parse_mode="html")
         sent.append("your chat")
     except Exception as ex:
         await m.edit(f"❌ Backup created but sending failed: {ex}")
@@ -541,12 +542,17 @@ async def cmd_stats(e):
     if not await require_staff(e):
         return
     st = await store.stats()
-    await flood_respond(e, 
+    try:
+        backups = len([f for f in os.listdir(BACKUP_DIR)
+                       if f.endswith(".json")])
+    except Exception:
+        backups = 0
+    await flood_respond(e,
         f"📈 <b>Bot Stats</b>\n\n"
         f"📺 Posting channels: <b>{st['collections'].get('channels', 0)}</b>\n"
         f"🔘 Button channels: <b>{st['collections'].get('button_channels', 0)}</b>\n"
         f"🖼 Cached images: <b>{st['collections'].get('images', 0)}</b>\n"
-        f"💾 Backups made: <b>{st['collections'].get('backups', 0)}</b>\n"
+        f"💾 Backups made: <b>{backups}</b>\n"
         f"🗄 Storage: <b>{st['mode'].upper()}</b> ({st.get('db_size_mb')} MB)",
         parse_mode="html")
 

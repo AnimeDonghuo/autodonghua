@@ -614,7 +614,7 @@ class Store:
                 out["db_size_mb"] = 0.0
         for name in COLLECTIONS:
             try:
-                out["collections"][name] = await self.col(name).count_documents()
+                out["collections"][name] = await self.col(name).count_documents({})
             except Exception:
                 out["collections"][name] = 0
         return out

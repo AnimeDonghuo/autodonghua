@@ -6,6 +6,7 @@ File flow: staff sends a donghua/anime file →
   channel-picker confirmation → send → store in TG DB channel.
 """
 import os
+import re
 import time
 import traceback
 
@@ -21,6 +22,125 @@ from mediainfo_util import analyze, caption_lines, quality_label
 from parser import normalize_key, parse_filename
 from sources import build_metadata
 from style import escape_html, RESTRICTED_MSG
+
+
+FAST_ENG = {"video": "360p-eng", "video (2)": "720p-eng",
+            "video (3)": "1080p-eng", "video (4)": "480p-eng"}
+
+
+def _fast_filename(fname: str):
+    """'Jie Men Zhi Xia Eps 20 [720p].mp4' -> ('Jie Men Zhi Xia', 20,
+    '720p'). '[Video]' / '[Video (2)]' / ... are the eng flavours
+    (360p/720p/1080p/480p-eng) — no mediainfo scan needed at all."""
+    m = re.match(r"^(?P<series>.+?)\s+Eps\s+(?P<ep>\d{1,4})\s+"
+                 r"\[(?P<tag>[^\]]+)\](?:\.\w+)?$", fname.strip())
+    if not m:
+        return None
+    tag = m.group("tag").strip().lower()
+    if re.fullmatch(r"\d{3,4}p", tag):
+        q = tag
+    elif tag in FAST_ENG:
+        q = FAST_ENG[tag]
+    elif tag.endswith("-eng"):
+        q = tag
+    else:
+        return None
+    return m.group("series").strip(), int(m.group("ep")), q
+
+
+async def _fast_ingest(e, fname, series, ep, quality, media_obj):
+    """Zero-scan ingest: the filename already says everything. The
+    file is archived BY REFERENCE (no re-upload), registered so the
+    API watcher skips it, and the designed card is posted/topped-up
+    on every matching channel (indo + eng)."""
+    import autodl
+    norm = normalize_key(series)
+    status = await flood_respond(
+        e, f"🔄 <b>Fast ingest</b> — {escape_html(series)} Ep {ep} "
+           f"[{quality}] — archiving by reference…",
+        parse_mode="html")
+    err = ""
+    try:
+        async with LOAD:
+            db_ids = await store.db_channel_ids()
+            if not db_ids:
+                if status:
+                    await flood_edit(status, "❌ No DB channel set — "
+                                             "/adddbchannel first.")
+                return
+            size = getattr(media_obj, "size", 0) or 0
+            poster, _src = await autodl.resolve_poster(
+                {"title": f"{series} Eps {ep:02d}", "series": series,
+                 "type": "donghua", "thumbnail": None}, series)
+            cap = (f"{series} — Ep {ep} [{quality}] "
+                   f"{autodl.human_size(size)}")
+            refs = []
+            for dbc in db_ids:
+                try:
+                    sentm = await app.send_file(
+                        dbc, file=media_obj, caption=cap,
+                        thumb=poster, supports_streaming=True)
+                    refs.append({
+                        "channel": int(dbc), "msg_id": sentm.id,
+                        "link": await autodl.file_link(dbc, sentm.id),
+                        "doc": autodl._doc_ref(sentm.document
+                                               or sentm.video)})
+                except Exception as exc:
+                    print(f"[file-flow] fast archive failed to "
+                          f"{dbc}: {exc}")
+            if not refs:
+                if status:
+                    await flood_edit(status, "❌ Archive failed to "
+                                             "every DB channel.")
+                return
+            primary, extra = refs[0], refs[1:]
+            await autodl.mark_downloaded(
+                0, norm, series, ep, quality,
+                {k: primary[k] for k in ("channel", "msg_id", "doc")},
+                primary["link"], size=size, db_extra=extra)
+            item = None
+            for sec in ("donghua", "anime"):
+                item = await autodl._search_episode(sec, series, ep)
+                if item:
+                    break
+            item = item or {"id": 0,
+                            "title": f"{series} Eps {ep:02d}",
+                            "series": series, "type": "donghua",
+                            "genres": [], "rating": None,
+                            "description": "", "section": "donghua"}
+            recs = [r for r in await store.find(
+                "downloaded", {"norm_title": norm, "episode": ep})
+                if r.get("file_link")]
+            links = {r["quality"]: r["file_link"] for r in recs}
+            deeps = {r["quality"]: (r.get("deep_link")
+                                    or await autodl.ensure_deep_link(
+                                        autodl._key(norm, ep,
+                                                    r["quality"]))
+                                    or r["file_link"]) for r in recs}
+            group = {"series": series, "norm": norm,
+                     "entries": [(item, [], item.get("streams", []))]}
+            posted = await autodl.post_episode(group, ep, links,
+                                               deeps, poster)
+            if status:
+                await flood_edit(
+                    status,
+                    f"✅ <b>Fast ingest done</b> — "
+                    f"{escape_html(series)} Ep {ep} [{quality}]\n\n"
+                    f"🗂 archived in {len(refs)} DB channel(s)\n"
+                    f"📺 cards posted/updated: {posted}\n"
+                    f"🧾 registered — the watcher skips this quality "
+                    f"from now on.", parse_mode="html")
+    except Exception:
+        err = traceback.format_exc()[-300:]
+        if status:
+            try:
+                await flood_edit(status,
+                                 f"❌ <b>Fast ingest failed:</b>\n"
+                                 f"<code>{escape_html(err)}</code>",
+                                 parse_mode="html")
+            except Exception:
+                pass
+        print("[file-flow] fast ingest error:", err)
 
 
 def _file_name(e) -> str:
@@ -151,6 +271,11 @@ async def on_file(e):
             parse_mode="html")
 
     fname = _file_name(e)
+    fast = _fast_filename(fname)
+    if fast:  # filename carries series/ep/quality: skip all scans
+        await _fast_ingest(e, fname, fast[0], fast[1], fast[2],
+                           media_obj)
+        return
     path = None
     status = None
     try:
@@ -273,7 +398,7 @@ async def send_pending(p, status_msg=None):
             await app.send_file(
                 cid, file=p["media_obj"], caption=p["caption"],
                 thumb=p.get("thumb_bytes"), supports_streaming=True,
-                force_document=(p["media_kind"] == "doc"))
+                force_document=False)
             sent = True
         except Exception as ex:
             err = str(ex)[:90]
@@ -283,7 +408,7 @@ async def send_pending(p, status_msg=None):
                 await app.send_file(
                     cid, file=p["path"], caption=p["caption"],
                     thumb=p.get("thumb_path"), supports_streaming=True,
-                    force_document=(p["media_kind"] == "doc"))
+                    force_document=False)
                 sent = True
             except Exception as ex:
                 err = str(ex)[:90]
@@ -300,7 +425,7 @@ async def send_pending(p, status_msg=None):
             sent_db = await app.send_file(
                 db_chan, file=p["media_obj"], caption=p["caption"],
                 thumb=p.get("thumb_bytes"), supports_streaming=True,
-                force_document=(p["media_kind"] == "doc"))
+                force_document=False)
             doc_obj = sent_db.document or sent_db.video
             db_info = {"channel": int(db_chan), "msg_id": sent_db.id,
                        "doc": _doc_ref(doc_obj)}
@@ -310,7 +435,7 @@ async def send_pending(p, status_msg=None):
                     db_chan, file=p["path"], caption=p["caption"],
                     thumb=p.get("thumb_path"),
                     supports_streaming=True,
-                    force_document=(p["media_kind"] == "doc"))
+                    force_document=False)
                 doc_obj = sent_db.document or sent_db.video
                 db_info = {"channel": int(db_chan), "msg_id": sent_db.id,
                            "doc": _doc_ref(doc_obj)}
@@ -358,7 +483,7 @@ async def serve_file(user_id: int, rec: dict):
     try:
         await app.send_file(
             user_id, file=media, caption=caption,
-            supports_streaming=True, force_document=True)
+            supports_streaming=True)
         return True
     except Exception:
         pass
@@ -372,7 +497,7 @@ async def serve_file(user_id: int, rec: dict):
                                        ids=extra["msg_id"])
             await app.send_file(
                 user_id, file=m.document or m.video, caption=caption,
-                supports_streaming=True, force_document=True)
+                supports_streaming=True)
             return True
         except Exception:
             continue
