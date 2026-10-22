@@ -376,6 +376,14 @@ def _file_name(e) -> str:
     return "video.mp4"
 
 
+def _caption_name(e) -> str:
+    """First caption line — users often name the file in the
+    caption while the file itself keeps a phone name like
+    video.mp4; the description must count too."""
+    txt = (e.text or "").strip()
+    return txt.splitlines()[0].strip() if txt else ""
+
+
 def build_caption(parsed: dict, info: dict, meta: dict, tag: str) -> str:
     lines = [f"🎬 <b>{escape_html(parsed['title'])}</b>"]
     if parsed.get("season"):
@@ -490,6 +498,12 @@ async def on_file(e):
 
     fname = _file_name(e)
     fast = _fast_filename(fname)
+    if not fast:  # the description may live in the caption instead
+        cap = _caption_name(e)
+        if cap and cap != fname:
+            got = _fast_filename(cap)
+            if got:
+                fname, fast = cap, got
     if fast:  # description carries series/ep/quality: instant path,
         await _fast_ingest(e, fname, fast[0], fast[1], fast[2],
                            media_obj)   # never waits on LOAD
@@ -499,7 +513,10 @@ async def on_file(e):
         return await flood_respond(e, 
             "⏳ <b>One file is being processed right now</b> — "
             "please wait a few seconds and send it again.\n\n"
-            "<i>(free-tier instances process one file at a time)</i>",
+            "<i>(free-tier instances process one file at a time)</i>\n"
+            "💡 <i>Name it</i> <code>Series Eps NN [quality]</code> "
+            "<i>(file name or caption) and I ingest it instantly "
+            "without any waiting.</i>",
             parse_mode="html")
 
     path = None
