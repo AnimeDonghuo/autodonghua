@@ -8,9 +8,11 @@ import os
 from telethon import events
 
 from config import THUMB_DIR
-from core import (PENDING, app, forcesub_check, save_thumb,
+from core import (PENDING, app, forcesub_check, is_staff,
+                  save_thumb,
                   store, url_bytes, wait_for, flood_respond, flood_edit)
-from handlers_files import (confirmation_text, markup,
+from handlers_files import (_fast_markup, confirmation_text,
+                            fast_batch_text, flush_batch, markup,
                               send_pending, serve_file)
 from handlers_user import forcesub_gate
 
@@ -178,6 +180,30 @@ async def cb_fs_admin(e):
 # ---------------------------------------------------------------------- #
 # File store — user downloads a clean copy (no tag)
 # ---------------------------------------------------------------------- #
+@app.on(events.CallbackQuery(pattern=rb"fast:(more|done):(-?\d+)"))
+async def cb_fast_batch(e):
+    """➕ Add more / ✅ Done buttons of the filename fast path."""
+    act = e.pattern_match.group(1).decode()
+    chat = int(e.pattern_match.group(2))
+    if not await is_staff(e.sender_id):
+        return await e.answer("Staff only.", alert=True)
+    if act == "more":
+        await e.answer("Ready — send the next file.")
+        try:
+            await e.edit(fast_batch_text(chat, ready=True),
+                         parse_mode="html",
+                         buttons=_fast_markup(chat))
+        except Exception:
+            pass
+        return
+    await e.answer("Building posters & cards…")
+    try:
+        msg = await e.get_message()
+    except Exception:
+        msg = None
+    await flush_batch(chat, msg)
+
+
 @app.on(events.CallbackQuery(pattern=rb"getfile:(.+)"))
 async def cb_getfile(e):
     rec_id = e.pattern_match.group(1).decode()

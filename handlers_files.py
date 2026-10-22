@@ -5,6 +5,7 @@ File flow: staff sends a donghua/anime file →
   image caching (custom or sourced, reused across episodes) →
   channel-picker confirmation → send → store in TG DB channel.
 """
+import asyncio
 import os
 import re
 import time
@@ -49,88 +50,181 @@ def _fast_filename(fname: str):
     return m.group("series").strip(), int(m.group("ep")), q
 
 
+FAST_BATCH = {}   # chat_id -> {"items": {(norm, ep): {...}}, ...}
+FAST_LOCK = asyncio.Lock()
+FAST_AUTO_SECONDS = 15 * 60
+
+
+def _fast_markup(chat_id: int) -> list:
+    return [[Button.inline("➕ Add more",
+                           f"fast:more:{chat_id}".encode())],
+            [Button.inline("✅ Done — poster & cards",
+                           f"fast:done:{chat_id}".encode())]]
+
+
+def fast_batch_text(chat_id: int, ready: bool = False) -> str:
+    b = FAST_BATCH.get(chat_id)
+    if not b or not b["items"]:
+        return "📥 <b>Batch empty</b> — send a file to start one."
+    lines = []
+    for (norm, ep), it in sorted(b["items"].items(),
+                                 key=lambda kv: kv[0][1]):
+        quals = ", ".join(sorted(it["quals"]))
+        lines.append(f"• <b>{escape_html(it['series'])}</b> Ep {ep} "
+                     f"— {quals} ({it['count']} file(s))")
+    head = ("📥 <b>Ready for the next file</b> — send it and it joins "
+            "this batch.\n\n" if ready else
+            "✅ <b>Archived & registered</b> — the watcher skips "
+            "these qualities now.\n\n")
+    return (head + "\n".join(lines) +
+            "\n\n<b>✅ Done</b> builds the posters & episode cards "
+            "for the whole batch.")
+
+
+async def _arm_auto_flush(chat_id: int):
+    b = FAST_BATCH.get(chat_id)
+    if not b:
+        return
+    if b.get("timer"):
+        b["timer"].cancel()
+    b["timer"] = asyncio.ensure_future(_auto_flush(chat_id))
+
+
+async def _auto_flush(chat_id: int):
+    await asyncio.sleep(FAST_AUTO_SECONDS)
+    b = FAST_BATCH.get(chat_id)
+    await flush_batch(chat_id, b.get("msg") if b else None, auto=True)
+
+
+async def flush_batch(chat_id: int, msg=None, auto: bool = False):
+    """The Done step: posters, descriptions and episode cards for
+    every (series, episode) collected in this chat's batch."""
+    import autodl
+    async with FAST_LOCK:
+        b = FAST_BATCH.pop(chat_id, None)
+        if not b or not b["items"]:
+            if msg:
+                try:
+                    await flood_edit(msg, "📥 <b>Batch empty</b> — "
+                                          "nothing to finish.")
+                except Exception:
+                    pass
+            return 0
+        done, failed = [], []
+        for (norm, ep), it in sorted(b["items"].items(),
+                                     key=lambda kv: kv[0][1]):
+            series = it["series"]
+            try:
+                item = None
+                for sec in ("donghua", "anime"):
+                    item = await autodl._search_episode(sec, series,
+                                                        ep)
+                    if item:
+                        break
+                item = item or {"id": 0,
+                                "title": f"{series} Eps {ep:02d}",
+                                "series": series, "type": "donghua",
+                                "genres": [], "rating": None,
+                                "description": "",
+                                "section": "donghua"}
+                poster, _src = await autodl.resolve_poster(item,
+                                                           series)
+                recs = [r for r in await store.find(
+                    "downloaded", {"norm_title": norm, "episode": ep})
+                    if r.get("file_link")]
+                links = {r["quality"]: r["file_link"] for r in recs}
+                deeps = {r["quality"]: (r.get("deep_link")
+                                        or await
+                                        autodl.ensure_deep_link(
+                                            autodl._key(norm, ep,
+                                                        r["quality"]))
+                                        or r["file_link"])
+                         for r in recs}
+                group = {"series": series, "norm": norm,
+                         "entries": [(item, [],
+                                      item.get("streams", []))]}
+                posted = await autodl.post_episode(group, ep, links,
+                                                   deeps, poster)
+                done.append(f"• <b>{escape_html(series)}</b> Ep {ep} "
+                            f"→ {posted} card(s)")
+            except Exception as exc:
+                failed.append(f"• {escape_html(series)} Ep {ep}: "
+                              f"<code>{escape_html(str(exc)[:80])}"
+                              f"</code>")
+    txt = (("⏰ <b>Auto-finish</b> (batch was idle) — " if auto else
+            "🎬 <b>Batch finished</b> — ") +
+           "posters & episode cards:\n\n" +
+           "\n".join(done or ["• nothing"]))
+    if failed:
+        txt += "\n\n❌ <b>Failed:</b>\n" + "\n".join(failed)
+    if msg:
+        try:
+            await flood_edit(msg, txt, parse_mode="html")
+        except Exception:
+            pass
+    return len(done)
+
+
 async def _fast_ingest(e, fname, series, ep, quality, media_obj):
-    """Zero-scan ingest: the filename already says everything. The
-    file is archived BY REFERENCE (no re-upload), registered so the
-    API watcher skips it, and the designed card is posted/topped-up
-    on every matching channel (indo + eng)."""
+    """Zero-scan ingest: the filename already says everything, so we
+    only check the description. The file is archived BY REFERENCE
+    (server-side copy — no re-upload) into every DB channel and
+    registered so the API watcher never re-downloads this quality.
+    Then the batch buttons appear: ➕ Add more / ✅ Done (Done builds
+    posters & cards). No LOAD lock — sends never queue behind it."""
     import autodl
     norm = normalize_key(series)
     status = await flood_respond(
         e, f"🔄 <b>Fast ingest</b> — {escape_html(series)} Ep {ep} "
            f"[{quality}] — archiving by reference…",
         parse_mode="html")
-    err = ""
     try:
-        async with LOAD:
-            db_ids = await store.db_channel_ids()
-            if not db_ids:
-                if status:
-                    await flood_edit(status, "❌ No DB channel set — "
-                                             "/adddbchannel first.")
-                return
-            size = getattr(media_obj, "size", 0) or 0
-            poster, _src = await autodl.resolve_poster(
-                {"title": f"{series} Eps {ep:02d}", "series": series,
-                 "type": "donghua", "thumbnail": None}, series)
-            cap = (f"{series} — Ep {ep} [{quality}] "
-                   f"{autodl.human_size(size)}")
-            refs = []
-            for dbc in db_ids:
-                try:
-                    sentm = await app.send_file(
-                        dbc, file=media_obj, caption=cap,
-                        thumb=poster)
-                    refs.append({
-                        "channel": int(dbc), "msg_id": sentm.id,
-                        "link": await autodl.file_link(dbc, sentm.id),
-                        "doc": autodl._doc_ref(sentm.document
-                                               or sentm.video)})
-                except Exception as exc:
-                    print(f"[file-flow] fast archive failed to "
-                          f"{dbc}: {exc}")
-            if not refs:
-                if status:
-                    await flood_edit(status, "❌ Archive failed to "
-                                             "every DB channel.")
-                return
-            primary, extra = refs[0], refs[1:]
-            await autodl.mark_downloaded(
-                0, norm, series, ep, quality,
-                {k: primary[k] for k in ("channel", "msg_id", "doc")},
-                primary["link"], size=size, db_extra=extra)
-            item = None
-            for sec in ("donghua", "anime"):
-                item = await autodl._search_episode(sec, series, ep)
-                if item:
-                    break
-            item = item or {"id": 0,
-                            "title": f"{series} Eps {ep:02d}",
-                            "series": series, "type": "donghua",
-                            "genres": [], "rating": None,
-                            "description": "", "section": "donghua"}
-            recs = [r for r in await store.find(
-                "downloaded", {"norm_title": norm, "episode": ep})
-                if r.get("file_link")]
-            links = {r["quality"]: r["file_link"] for r in recs}
-            deeps = {r["quality"]: (r.get("deep_link")
-                                    or await autodl.ensure_deep_link(
-                                        autodl._key(norm, ep,
-                                                    r["quality"]))
-                                    or r["file_link"]) for r in recs}
-            group = {"series": series, "norm": norm,
-                     "entries": [(item, [], item.get("streams", []))]}
-            posted = await autodl.post_episode(group, ep, links,
-                                               deeps, poster)
+        db_ids = await store.db_channel_ids()
+        if not db_ids:
             if status:
-                await flood_edit(
-                    status,
-                    f"✅ <b>Fast ingest done</b> — "
-                    f"{escape_html(series)} Ep {ep} [{quality}]\n\n"
-                    f"🗂 archived in {len(refs)} DB channel(s)\n"
-                    f"📺 cards posted/updated: {posted}\n"
-                    f"🧾 registered — the watcher skips this quality "
-                    f"from now on.", parse_mode="html")
+                await flood_edit(status, "❌ No DB channel set — "
+                                         "/adddbchannel first.")
+            return
+        size = getattr(media_obj, "size", 0) or 0
+        cap = (f"{series} — Ep {ep} [{quality}] "
+               f"{autodl.human_size(size)}")
+        refs = []
+        for dbc in db_ids:
+            try:
+                sentm = await app.send_file(dbc, file=media_obj,
+                                            caption=cap)
+                refs.append({
+                    "channel": int(dbc), "msg_id": sentm.id,
+                    "link": await autodl.file_link(dbc, sentm.id),
+                    "doc": autodl._doc_ref(sentm.document
+                                           or sentm.video)})
+            except Exception as exc:
+                print(f"[file-flow] fast archive failed to "
+                      f"{dbc}: {exc}")
+        if not refs:
+            if status:
+                await flood_edit(status, "❌ Archive failed to "
+                                         "every DB channel.")
+            return
+        primary, extra = refs[0], refs[1:]
+        await autodl.mark_downloaded(
+            0, norm, series, ep, quality,
+            {k: primary[k] for k in ("channel", "msg_id", "doc")},
+            primary["link"], size=size, db_extra=extra)
+        b = FAST_BATCH.setdefault(e.chat_id, {"items": {},
+                                              "timer": None,
+                                              "msg": status})
+        it = b["items"].setdefault((norm, ep),
+                                   {"series": series, "quals": set(),
+                                    "count": 0})
+        it["quals"].add(quality)
+        it["count"] += 1
+        b["msg"] = status
+        await _arm_auto_flush(e.chat_id)
+        if status:
+            await flood_edit(status, fast_batch_text(e.chat_id),
+                             parse_mode="html",
+                             buttons=_fast_markup(e.chat_id))
     except Exception:
         err = traceback.format_exc()[-300:]
         if status:
@@ -264,6 +358,13 @@ async def on_file(e):
     if e.document and not is_video_doc(e.document) and not e.video:
         return  # ignore non-media documents in the auto flow
 
+    fname = _file_name(e)
+    fast = _fast_filename(fname)
+    if fast:  # description carries series/ep/quality: instant path,
+        await _fast_ingest(e, fname, fast[0], fast[1], fast[2],
+                           media_obj)   # never waits on LOAD
+        return
+
     if LOAD.locked():
         return await flood_respond(e, 
             "⏳ <b>One file is being processed right now</b> — "
@@ -271,12 +372,6 @@ async def on_file(e):
             "<i>(free-tier instances process one file at a time)</i>",
             parse_mode="html")
 
-    fname = _file_name(e)
-    fast = _fast_filename(fname)
-    if fast:  # filename carries series/ep/quality: skip all scans
-        await _fast_ingest(e, fname, fast[0], fast[1], fast[2],
-                           media_obj)
-        return
     path = None
     status = None
     try:
