@@ -15,7 +15,8 @@ from telethon.tl.custom import Button
 from telethon.tl.types import DocumentAttributeFilename, InputDocument
 
 from config import DOWNLOAD_DIR, THUMB_DIR
-from core import (AUTH, LOAD, PENDING, WAITERS, app, authed, bot_user,
+from core import (AUTH, LOAD, PENDING, WAITERS, app, authed,
+                  bot_user, fname_attrs,
                   image_bytes, is_staff, is_video_doc, now_key,
                   save_thumb, store, url_bytes, flood_respond, flood_edit)
 from mediainfo_util import analyze, caption_lines, quality_label
@@ -408,7 +409,8 @@ async def send_pending(p, status_msg=None):
                 await app.send_file(
                     cid, file=p["path"], caption=p["caption"],
                     thumb=p.get("thumb_path"), supports_streaming=True,
-                    force_document=False)
+                    force_document=False,
+                    attributes=fname_attrs(p["caption"], p["path"]))
                 sent = True
             except Exception as ex:
                 err = str(ex)[:90]
@@ -435,7 +437,8 @@ async def send_pending(p, status_msg=None):
                     db_chan, file=p["path"], caption=p["caption"],
                     thumb=p.get("thumb_path"),
                     supports_streaming=True,
-                    force_document=False)
+                    force_document=False,
+                    attributes=fname_attrs(p["caption"], p["path"]))
                 doc_obj = sent_db.document or sent_db.video
                 db_info = {"channel": int(db_chan), "msg_id": sent_db.id,
                            "doc": _doc_ref(doc_obj)}

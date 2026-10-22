@@ -422,6 +422,29 @@ async def flood_edit(e, *args, **kwargs):
         return None
 
 
+def fname_attrs(caption, path=None, default="video"):
+    """DocumentAttributeFilename so the stored file carries the SAME
+    name as the description written on the message. Telethon merges
+    attributes per class, so the inferred DocumentAttributeVideo
+    (supports_streaming=True) is preserved — still streamable media,
+    never a document."""
+    import os as _os
+    import re as _re
+    from telethon.tl.types import DocumentAttributeFilename
+    base = (caption or "").strip().splitlines()[0].strip() if caption \
+        else ""
+    base = _re.sub(r'[\\/:*?"<>|\r\n\t]', "-", base)
+    base = _re.sub(r"\s+", " ", base).strip()[:150] or default
+    ext = ""
+    if path:
+        ext = _os.path.splitext(str(path))[1][:8]
+    if not ext:
+        ext = ".mp4"
+    if not base.lower().endswith(ext.lower()):
+        base += ext
+    return [DocumentAttributeFilename(file_name=base)]
+
+
 async def flood_send_file(e, *args, **kwargs):
     """send_file into the event's chat, FloodWait-safe (the backup
     flow used respond(file=, caption=) which send_message rejects)."""

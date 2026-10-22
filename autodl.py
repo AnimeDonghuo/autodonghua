@@ -850,7 +850,9 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                             progress_callback=up_cb)
                         sent = await app.send_file(
                             dbc, file=up, caption=cap,
-                            thumb=poster, supports_streaming=True)
+                            thumb=poster, supports_streaming=True,
+                            attributes=core_mod.fname_attrs(
+                                f"{series} Eps {ep:02d} [{q}]", path))
                     else:
                         # server-side copy: reuse the media Telegram
                         # already stores — zero re-upload, instant
