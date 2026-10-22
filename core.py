@@ -425,9 +425,9 @@ async def flood_edit(e, *args, **kwargs):
 def fname_attrs(caption, path=None, default="video"):
     """DocumentAttributeFilename so the stored file carries the SAME
     name as the description written on the message. Telethon merges
-    attributes per class, so the inferred DocumentAttributeVideo
-    (supports_streaming=True) is preserved — still streamable media,
-    never a document."""
+    attributes per class, so the inferred DocumentAttributeVideo is
+    preserved — always real video media with its thumbnail, never a
+    plain document."""
     import os as _os
     import re as _re
     from telethon.tl.types import DocumentAttributeFilename
