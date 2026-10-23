@@ -655,10 +655,13 @@ def pick_eng_synopsis(meta, indo_syn: str) -> str:
 
 
 def _eng_title(meta) -> str:
+    """The ENGLISH title only (AniList 'english' / MAL
+    'title_english'). Romaji/pinyin main titles must never leak in
+    as a fake '| english' suffix (the 'Wu Shang Shen Di 2' case)."""
     bs = (meta or {}).get("by_source") or {}
     for src in ("anilist", "jikan"):
         r = bs.get(src)
-        t = (getattr(r, "title", "") or "").strip()
+        t = (getattr(r, "eng_title", "") or "").strip()
         if t:
             return t
     return ""
@@ -1729,7 +1732,7 @@ async def _search_episode(section: str, series: str, ep):
             continue
         na, ns = normalize_key(s), normalize_key(series)
         if not (na == ns or na in ns or ns in na
-                or fuzzy_ratio(s, series) >= 80):
+                or fuzzy_ratio(s, series) >= 0.8):
             continue
         item.setdefault("section", section)
         return item

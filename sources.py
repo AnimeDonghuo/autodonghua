@@ -40,6 +40,7 @@ SOURCE_LABELS = {
 class SourceResult:
     source: str
     title: str = ""
+    eng_title: str = ""
     image: str = None
     description: str = None
     url: str = None
@@ -72,22 +73,46 @@ query ($q: String) {
 """
 
 
+def title_variants(title: str):
+    """Search queries for a series name: the raw name first, then
+    cleaned forms — '(2023)' years and '2nd Season / Season 2 /
+    Part 2' suffixes make AniList/Jikan miss otherwise."""
+    import re as _re
+    out = [title]
+    t = _re.sub(r"\(\d{4}\)", " ", title or "")
+    t = _re.sub(r"\b\d*(?:st|nd|rd|th)?\s*[Ss]eason\b", " ", t)
+    t = _re.sub(r"\b[Ss]eason\s*\d+\b", " ", t)
+    t = _re.sub(r"\b[Pp]art\s*\d+\b", " ", t)
+    t = _re.sub(r"\s+", " ", t).strip()
+    if t and t != title:
+        out.append(t)
+    return out
+
+
 async def anilist(session, title: str):
-    try:
-        async with session.post(
-                "https://graphql.anilist.co",
-                json={"query": ANILIST_QUERY, "variables": {"q": title}},
-                timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                return None
-            data = (await resp.json()).get("data", {}).get("Page", {}).get("media", [])
-    except Exception:
-        return None
+    data = []
+    for q in title_variants(title):
+        try:
+            async with session.post(
+                    "https://graphql.anilist.co",
+                    json={"query": ANILIST_QUERY,
+                          "variables": {"q": q}},
+                    timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    continue
+                data = (await resp.json()).get("data", {}).get(
+                    "Page", {}).get("media", [])
+        except Exception:
+            continue
+        if data:
+            break
     if not data:
         return None
     scored = sorted(
-        [(fuzzy_ratio(title, m.get("title", {}).get("english")
-                      or m.get("title", {}).get("romaji") or ""), m) for m in data],
+        [(max(fuzzy_ratio(title, m.get("title", {}).get("english")
+                          or ""),
+              fuzzy_ratio(title, m.get("title", {}).get("romaji")
+                          or "")), m) for m in data],
         key=lambda x: -x[0])
     _, m = scored[0]
     t = m.get("title", {})
@@ -95,6 +120,7 @@ async def anilist(session, title: str):
     return SourceResult(
         source="anilist",
         title=t.get("english") or t.get("romaji") or title,
+        eng_title=t.get("english") or "",
         image=img,
         description=(m.get("description") or "")[:900],
         url=m.get("siteUrl"),
@@ -109,23 +135,31 @@ async def anilist(session, title: str):
 # 2. Jikan (MyAnimeList mirror)
 # ---------------------------------------------------------------------- #
 async def jikan(session, title: str):
-    try:
-        url = "https://api.jikan.moe/v4/anime"
-        params = {"q": title, "limit": 5, "sfw": "true"}
-        async with session.get(url, params=params) as resp:
-            if resp.status != 200:
-                return None
-            data = (await resp.json()).get("data", [])
-    except Exception:
-        return None
+    data = []
+    for q in title_variants(title):
+        try:
+            url = "https://api.jikan.moe/v4/anime"
+            params = {"q": q, "limit": 5, "sfw": "true"}
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    continue
+                data = (await resp.json()).get("data", [])
+        except Exception:
+            continue
+        if data:
+            break
     if not data:
         return None
-    scored = sorted([(fuzzy_ratio(title, a.get("title", "")), a) for a in data],
-                    key=lambda x: -x[0])
+    scored = sorted(
+        [(max(fuzzy_ratio(title, a.get("title", "")),
+              fuzzy_ratio(title, a.get("title_english") or "")), a)
+         for a in data],
+        key=lambda x: -x[0])
     _, a = scored[0]
     return SourceResult(
         source="jikan",
-        title=a.get("title") or title,
+        title=a.get("title_english") or a.get("title") or title,
+        eng_title=a.get("title_english") or "",
         image=(a.get("images", {}).get("jpg", {}) or {}).get("large_image_url"),
         description=(a.get("synopsis") or "")[:900],
         url=a.get("url"),
