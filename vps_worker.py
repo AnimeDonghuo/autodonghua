@@ -5,10 +5,12 @@ Downloads episode files on your VPS (fast pipe) and archives them
 into the DB channel, so the Koyeb instance (slow upload) only does
 the light work: reference copies, posters, cards, DMs, registry.
 
-Talks to the bot's Koyeb instance over HTTPS with the shared secret
-from /addvps. Needs ONLY telethon (+ optional Pillow/hachoir for
-thumbs & real video metadata). Config: vps_worker.json next to this
-file, written by vps_setup.sh.
+Deployed & supervised by the bot itself over SSH (/addvps).
+Talks to the Koyeb instance over HTTPS with the shared secret.
+Needs ONLY telethon (+ optional Pillow/hachoir). Config file
+vps_worker.json sits next to this file. Files are deleted right
+after a successful upload; live progress is reported so the Koyeb
+/status panel shows the job exactly like a local one.
 """
 import base64
 import json
@@ -22,6 +24,8 @@ CFG_PATH = os.path.join(HERE, "vps_worker.json")
 DL = os.path.join(HERE, "dl")
 
 CFG = {}
+_PROG = {"last": 0.0}
+_COUNT = {"bytes": 0, "t0": time.time()}
 
 
 def log(*a):
@@ -55,17 +59,36 @@ def caps():
     return c
 
 
-def download(url, path):
+def progress(job_id, phase, done, total):
+    now = time.time()
+    if now - _PROG["last"] < 3:
+        return
+    _PROG["last"] = now
+    dt = max(0.5, now - _COUNT["t0"])
+    speed = (_COUNT["bytes"] / dt) / 1048576
+    try:
+        api("/vps/progress", {"secret": CFG["secret"], "job": job_id,
+                              "phase": phase, "done": int(done),
+                              "total": int(total or 0),
+                              "speed": round(speed, 2)})
+    except Exception:
+        pass
+
+
+def download(url, path, job_id):
     t0 = time.time()
     done = 0
     with urllib.request.urlopen(url, timeout=120) as r, \
             open(path, "wb") as fh:
+        total = int(r.headers.get("Content-Length") or 0)
         while True:
             chunk = r.read(1 << 20)
             if not chunk:
                 break
             fh.write(chunk)
             done += len(chunk)
+            _COUNT["bytes"] = done
+            progress(job_id, "download", done, total)
     secs = max(1.0, time.time() - t0)
     return done, done / secs / 1048576  # bytes, MB/s
 
@@ -92,23 +115,37 @@ def ensure_client(client, creds):
 
 def run_one(job, client):
     os.makedirs(DL, exist_ok=True)
+    jid = job["_id"]
     name = "".join(c if c.isalnum() or c in "._- " else "_"
                    for c in (job.get("filename") or "video.mp4"))
     path = os.path.join(DL, name)
-    log(f"job {job['_id']}: downloading {job['url'][:70]}")
-    size, speed = download(job["url"], path)
+    _COUNT.update(bytes=0, t0=time.time())
+    log(f"job {jid}: downloading {job['url'][:70]}")
+    size, speed = download(job["url"], path, jid)
     thumb = None
     if job.get("thumb_b64"):
         try:
             thumb = base64.b64decode(job["thumb_b64"])
         except Exception:
             thumb = None
-    log(f"job {job['_id']}: downloaded {size} B at {speed:.1f} MB/s "
-        f"— uploading to {job['channel']}")
+    log(f"job {jid}: downloaded {size} B at {speed:.1f} MB/s — "
+        f"uploading to {job['channel']}")
+    _COUNT.update(bytes=0, t0=time.time())
+    up = {"last": 0.0}
+
+    def up_cb(sent_bytes, total_bytes):
+        now = time.time()
+        if now - up["last"] < 3:
+            return
+        up["last"] = now
+        _COUNT["bytes"] = sent_bytes
+        progress(jid, "upload", sent_bytes, total_bytes)
+
     sent = client.send_file(
         job["channel"], file=path, caption=job.get("caption") or "",
         thumb=thumb, supports_streaming=True,
-        attributes=video_attrs(path, name))
+        attributes=video_attrs(path, name),
+        progress_callback=up_cb)
     doc = sent.document or sent.video
     out = {"msg_id": sent.id, "size": size,
            "speed": round(speed, 2),
@@ -119,14 +156,14 @@ def run_one(job, client):
         os.remove(path)  # VPS disk stays clean
     except Exception:
         pass
-    log(f"job {job['_id']}: archived msg {sent.id}")
+    log(f"job {jid}: archived msg {sent.id}")
     return out
 
 
 def main():
     global CFG
     if not os.path.exists(CFG_PATH):
-        sys.exit("vps_worker.json missing — run vps_setup.sh first")
+        sys.exit("vps_worker.json missing — run /addvps again")
     CFG = json.load(open(CFG_PATH))
     os.makedirs(DL, exist_ok=True)
     client = None

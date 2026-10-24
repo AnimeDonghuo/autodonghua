@@ -864,6 +864,14 @@ async def _vps_archive(job, series, ep, q, url, db0, poster):
         d = d[0] if d else None
         if not d:
             return None
+        prog = d.get("prog") or {}
+        if prog and (time.time() - prog.get("ts", 0)) < 30:
+            # live VPS progress into the normal job/panel fields
+            job["phase"] = prog.get("phase") or job["phase"]
+            job["done"] = prog.get("done") or 0
+            job["total"] = prog.get("total") or 0
+            job["speed"] = prog.get("speed") or 0
+            job["via"] = "VPS"
         st = d.get("status")
         if st == "done":
             msg_id = (d.get("result") or {}).get("msg_id")

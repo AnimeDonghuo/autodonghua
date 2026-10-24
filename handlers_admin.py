@@ -282,42 +282,238 @@ async def cmd_setowner(e):
                     f"DM'd to you.", parse_mode="html")
 
 
+# ---------------- VPS SSH provisioning ----------------
+VPS_DIR = "vpsnode"
+
+
+def _ssh_client(cfg):
+    import paramiko
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(cfg["host"], username=cfg.get("user") or "root",
+                password=cfg.get("pass"), timeout=25,
+                allow_agent=False, look_for_keys=False,
+                banner_timeout=25)
+    return cli
+
+
+async def ssh_exec(cfg, cmd, timeout=120):
+    def _run():
+        cli = _ssh_client(cfg)
+        try:
+            _i, out, err = cli.exec_command(cmd, timeout=timeout)
+            rc = out.channel.recv_exit_status()
+            return (rc, out.read().decode("utf-8", "replace"),
+                    err.read().decode("utf-8", "replace"))
+        finally:
+            cli.close()
+    return await asyncio.to_thread(_run)
+
+
+async def ssh_put(cfg, data: bytes, remote_path: str):
+    def _run():
+        cli = _ssh_client(cfg)
+        try:
+            sftp = cli.open_sftp()
+            with sftp.open(remote_path, "wb") as fh:
+                fh.write(data)
+            sftp.close()
+        finally:
+            cli.close()
+    return await asyncio.to_thread(_run)
+
+
+async def _ask(e, q):
+    await flood_respond(e, q, parse_mode="html")
+    try:
+        r = await wait_for(e.chat_id, timeout=180)
+    except Exception:
+        return None
+    return (r.text or "").strip() if r else None
+
+
+async def _vps_fail(msg, where, exc):
+    if msg:
+        try:
+            await flood_edit(msg, f"❌ <b>VPS setup failed</b> ({where}):\n"
+                                  f"<code>{escape_html(str(exc)[:220])}"
+                                  f"</code>", parse_mode="html")
+        except Exception:
+            pass
+    try:
+        import autodl
+        await autodl._owner_dm(
+            f"❌ <b>VPS setup failed</b> ({where}):\n"
+            f"<code>{escape_html(str(exc)[:220])}</code>")
+    except Exception:
+        pass
+
+
+async def _provision(chat_id, msg):
+    """SSH into the VPS and install/deploy/start the worker, step by
+    step, reporting every failure to the owner."""
+    v = dict(await store.get_config("vps") or {})
+    cfg = v.get("ssh") or {}
+    try:
+        if msg:
+            await flood_edit(msg, f"🔌 Connecting to "
+                                  f"<code>{escape_html(cfg.get('user'))}"
+                                  f"@{escape_html(cfg.get('host'))}</code>…",
+                             parse_mode="html")
+        rc, out, _ = await ssh_exec(
+            cfg, "echo ok; head -2 /etc/os-release 2>/dev/null", 40)
+        if rc != 0 or "ok" not in out:
+            raise RuntimeError(f"ssh rc={rc}: {out[:80]}")
+        osrel = " ".join(out.splitlines()[1:3]) or "linux"
+        if msg:
+            await flood_edit(msg, f"🐍 <b>Connected</b> — "
+                                  f"{escape_html(osrel)[:56]} — "
+                                  f"checking python…",
+                             parse_mode="html")
+
+        def _ver(t):
+            try:
+                return tuple(int(x) for x in
+                             (t or "").strip().split()[-1]
+                             .split(".")[:2])
+            except Exception:
+                return (0, 0)
+        rc, out, _ = await ssh_exec(cfg, "python3 -V 2>&1 || true", 30)
+        if _ver(out) < (3, 7):
+            if msg:
+                await flood_edit(msg, "🐍 python3 too old / missing — "
+                                      "apt-installing python3…",
+                                 parse_mode="html")
+            await ssh_exec(cfg, "apt-get update -y && apt-get "
+                                "install -y python3 python3-pip", 900)
+            rc, out, _ = await ssh_exec(cfg, "python3 -V 2>&1 || true",
+                                        30)
+        if _ver(out) < (3, 7):
+            raise RuntimeError(
+                f"VPS python3 is {'.'.join(map(str, _ver(out)))} — "
+                "the worker needs Debian 10 (buster) or newer")
+        if msg:
+            await flood_edit(msg, "📦 Installing telethon on the VPS…",
+                             parse_mode="html")
+        await ssh_exec(cfg,
+                       "python3 -c 'import telethon' 2>/dev/null || "
+                       "python3 -m pip install --user telethon || "
+                       "python3 -m pip install --break-system-packages "
+                       "--user telethon || pip3 install telethon", 900)
+        rc, out, _ = await ssh_exec(
+            cfg, "python3 -c 'import telethon; "
+                 "print(telethon.__version__)' 2>&1", 60)
+        if rc != 0 or "Traceback" in out:
+            raise RuntimeError("telethon install failed on the VPS")
+        tver = out.strip().splitlines()[-1]
+        await ssh_exec(cfg, "python3 -m pip install --user Pillow "
+                            "hachoir >/dev/null 2>&1 || true", 300)
+        if msg:
+            await flood_edit(msg, f"🚀 telethon {escape_html(tver)} ✓ "
+                                  f"— deploying worker…",
+                             parse_mode="html")
+        rc, out, _ = await ssh_exec(cfg, "echo $HOME", 20)
+        home = out.strip() or "/root"
+        await ssh_exec(cfg, f"mkdir -p {home}/{VPS_DIR}/dl", 30)
+        worker = open(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "vps_worker.py"), "rb").read()
+        await ssh_put(cfg, worker, f"{home}/{VPS_DIR}/vps_worker.py")
+        conf = json.dumps({"base": v.get("base"),
+                           "secret": v.get("secret")})
+        await ssh_put(cfg, conf.encode(),
+                      f"{home}/{VPS_DIR}/vps_worker.json")
+        await ssh_exec(cfg, f"chmod 600 {home}/{VPS_DIR}/"
+                            "vps_worker.json", 20)
+        cron = (f"@reboot cd {home}/{VPS_DIR} && nohup python3 "
+                f"vps_worker.py >> worker.log 2>&1 &")
+        await ssh_exec(cfg, f"(crontab -l 2>/dev/null | grep -v "
+                            f"vps_worker.py; echo '{cron}') | crontab -",
+                       30)
+        await ssh_exec(cfg, f"pkill -f vps_worker.py; sleep 1; "
+                            f"cd {home}/{VPS_DIR} && nohup python3 "
+                            f"vps_worker.py >> worker.log 2>&1 & "
+                            f"sleep 2; pgrep -f vps_worker.py", 60)
+        if msg:
+            await flood_edit(msg, "💓 Waiting for worker heartbeat…",
+                             parse_mode="html")
+        online = False
+        for _ in range(25):
+            await asyncio.sleep(3)
+            if (await vps_state()).get("online"):
+                online = True
+                break
+        if not online:
+            rc, out, _ = await ssh_exec(
+                cfg, f"tail -5 {home}/{VPS_DIR}/worker.log 2>/dev/null",
+                30)
+            raise RuntimeError("worker did not heartbeat — log: "
+                               + out[-200:])
+        st = await vps_state()
+        caps = st.get("caps") or {}
+        yes = lambda k: "✓" if caps.get(k) else "✗"
+        if msg:
+            await flood_edit(msg,
+                             f"✅ <b>VPS connected & worker online</b>"
+                             f"\n\n🐍 {caps.get('py')} · telethon "
+                             f"{tver} · Pillow {yes('PIL')} · hachoir "
+                             f"{yes('hachoir')}\n💾 "
+                             f"{caps.get('disk_mb')} MB free · "
+                             f"{escape_html(osrel)[:40]}\n\n"
+                             f"🔁 Worker auto-starts on VPS reboot "
+                             f"(cron installed).\n"
+                             f"Now flip the mode: /vps on",
+                             parse_mode="html")
+    except Exception as exc:
+        await _vps_fail(msg, "provisioning", exc)
+
+
 @app.on(events.NewMessage(pattern=r"^/addvps(?:\s+(.+))?$"))
 async def cmd_addvps(e):
-    """Register a VPS download+upload worker (a SECOND bot token —
-    never the main bot: two sessions on one token split updates)."""
+    """Register + provision a VPS worker: user, IP, root password,
+    worker bot token, koyeb url. The bot SSHes in and installs
+    everything itself."""
     if not await is_owner(e.sender_id):
         return await flood_respond(e, "👑 Owner only.")
     parts = (e.text or "").split(None, 1)
     args = parts[1].split() if len(parts) > 1 else []
-    if not args:
-        return await flood_respond(
-            e, "🖥 <b>Usage:</b> /addvps &lt;worker bot token&gt; "
-               "[koyeb base url]\n\nThe worker is a <b>second bot</b> "
-               "from @BotFather, added as admin in every DB channel — "
-               "never the main bot token.", parse_mode="html")
+    if len(args) >= 4:
+        user, host, pw, token = args[:4]
+        base = args[4] if len(args) > 4 else ""
+    else:
+        await flood_respond(e, "🖥 <b>Add your VPS</b> — answer the "
+                               "next questions here (the bot installs "
+                               "everything over SSH itself).",
+                            parse_mode="html")
+        user = (await _ask(e, "1️⃣ VPS username? <i>(default root)"
+                              "</i>")) or "root"
+        host = await _ask(e, "2️⃣ VPS IP / hostname?")
+        pw = await _ask(e, "3️⃣ Password for that user?")
+        token = await _ask(e, "4️⃣ <b>Worker bot token</b> — a SECOND "
+                              "bot from @BotFather (never the main "
+                              "bot token)?")
+        base = await _ask(e, "5️⃣ Koyeb base url "
+                             "(https://….koyeb.app)? send "
+                             "<code>-</code> to keep the stored one")
+        base = "" if base in ("-", None) else base
+        if not (host and pw and token):
+            return await flood_respond(e, "❌ VPS setup cancelled — "
+                                          "missing answers.")
     v = dict(await store.get_config("vps") or {})
-    base = (args[1].strip().rstrip("/") if len(args) > 1
-            else v.get("base") or "")
-    v.update({"token": args[0].strip(), "base": base,
+    v.update({"ssh": {"host": host.strip(), "user": user.strip(),
+                      "pass": pw.strip()},
+              "token": token.strip(),
+              "base": (base or v.get("base") or "").rstrip("/"),
               "secret": v.get("secret") or secrets.token_hex(8),
-              "enabled": False, "beat": 0,
-              "jobs": v.get("jobs") or 0, "bytes": v.get("bytes") or 0})
+              "enabled": False, "beat": 0})
     await store.set_config("vps", v)
-    raw = ("https://raw.githubusercontent.com/AnimeDonghuo/"
-           "autodonghua/arena/25bec0bc-autodonghua")
-    await flood_respond(
-        e,
-        "🖥 <b>VPS worker registered</b> (off until /vps on).\n\n"
-        "1️⃣ Add the worker bot as <b>admin</b> in every DB channel.\n"
-        "2️⃣ On the VPS run:\n"
-        f"<code>curl -sL {raw}/vps_setup.sh -o s.sh && "
-        f"bash s.sh {base or 'https://YOUR-APP.koyeb.app'} "
-        f"{v['secret']}</code>\n"
-        "<i>The script auto-checks & installs python3 ≥ 3.7, "
-        "telethon, Pillow, hachoir (Debian 10+).</i>\n"
-        "3️⃣ When the worker heartbeats: /vps on",
-        parse_mode="html")
+    if not v["base"]:
+        return await flood_respond(
+            e, "❌ Still need the Koyeb base url — /addvps again with "
+               "it as the 5th value.")
+    msg = await flood_respond(e, "🔌 Starting VPS setup…",
+                              parse_mode="html")
+    asyncio.ensure_future(_provision(e.chat_id, msg))
 
 
 @app.on(events.NewMessage(pattern=r"^/vps(?:\s+(on|off))?$"))
@@ -353,6 +549,8 @@ async def cmd_vps(e):
         f"<b>{round((st.get('bytes') or 0) / 1073741824, 2)} GB</b> "
         f"uploaded · avg {st.get('speed') or 0} MB/s",
         f"Base: <code>{escape_html(st.get('base') or 'not set')}</code>",
+        f"SSH: <code>{escape_html((st.get('ssh') or {}).get('user', '-'))}"
+        f"@{escape_html((st.get('ssh') or {}).get('host', '-'))}</code>",
     ]
     if st.get("enabled") and not st.get("online"):
         lines.append("⚠️ ON but worker offline — jobs automatically "
@@ -360,10 +558,56 @@ async def cmd_vps(e):
     await flood_respond(e, "\n".join(lines), parse_mode="html")
 
 
+async def vps_watchdog_loop():
+    """Every 5 min: if the mode is ON but the worker went silent and
+    we have SSH creds, restart it on the VPS; tell the owner if even
+    that fails (once per hour)."""
+    while True:
+        await asyncio.sleep(300)
+        try:
+            st = await vps_state()
+            if not (st.get("enabled") and st.get("ssh")) \
+                    or st.get("online"):
+                continue
+            rc, out, _ = await ssh_exec(st["ssh"],
+                                        "pgrep -f vps_worker.py || true",
+                                        40)
+            if out.strip():
+                continue
+            rc, out, _ = await ssh_exec(
+                st["ssh"], "cd $HOME/vpsnode && nohup python3 "
+                           "vps_worker.py >> worker.log 2>&1 & "
+                           "sleep 2; pgrep -f vps_worker.py", 60)
+            print("[vps] watchdog restart:", out.strip()[:40] or "failed")
+            if not out.strip():
+                if time.time() - (st.get("wd_warn") or 0) > 3600:
+                    v = dict(st)
+                    v["wd_warn"] = time.time()
+                    await store.set_config("vps", v)
+                    import autodl
+                    await autodl._owner_dm(
+                        "❌ <b>VPS worker is down</b> and the watchdog "
+                        "could not restart it over SSH — jobs run on "
+                        "Koyeb until it's back.")
+        except Exception as exc:
+            print("[vps] watchdog error:", repr(exc)[:120])
+
+
 @app.on(events.NewMessage(pattern=r"^/removevps$"))
 async def cmd_removevps(e):
     if not await is_owner(e.sender_id):
         return await flood_respond(e, "👑 Owner only.")
+    v = dict(await store.get_config("vps") or {})
+    if v.get("ssh"):
+        try:
+            await ssh_exec(v["ssh"], "pkill -f vps_worker.py; "
+                           "crontab -l 2>/dev/null | grep -v "
+                           "vps_worker.py | crontab -", 60)
+        except Exception as exc:
+            await flood_respond(e, f"⚠️ Worker could not be stopped "
+                                   f"over SSH: "
+                                   f"<code>{escape_html(str(exc)[:100])}"
+                                   f"</code>", parse_mode="html")
     await store.set_config("vps", {})
     for d in await store.find("vps_jobs"):
         try:

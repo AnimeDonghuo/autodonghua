@@ -79,6 +79,26 @@ async def vps_claim(secret):
                       "token": v.get("token")}}
 
 
+async def vps_progress(secret, payload):
+    """Live download/upload progress from the worker — mirrored
+    into the job dict so /status & the owner panel show it exactly
+    like a local Koyeb job."""
+    v = dict(await store.get_config("vps") or {})
+    if not v.get("secret") or secret != v.get("secret"):
+        return False
+    jid = (payload or {}).get("job")
+    if not jid:
+        return False
+    await store.col("vps_jobs").update_one(
+        {"_id": jid},
+        {"$set": {"prog": {"phase": payload.get("phase"),
+                           "done": int(payload.get("done") or 0),
+                           "total": int(payload.get("total") or 0),
+                           "speed": float(payload.get("speed") or 0),
+                           "ts": time.time()}}})
+    return True
+
+
 async def vps_report(secret, payload):
     v = dict(await store.get_config("vps") or {})
     if not v.get("secret") or secret != v.get("secret"):
@@ -101,9 +121,22 @@ async def vps_report(secret, payload):
                 ((float(v.get("speed") or 0) * (n - 1)) + sp) / n, 2)
     else:
         sets["error"] = str((payload or {}).get("error") or "")[:200]
+    doc = await store.find("vps_jobs", {"_id": jid})
+    doc = doc[0] if doc else {}
     await store.col("vps_jobs").update_one({"_id": jid},
                                            {"$set": sets})
     await store.set_config("vps", v)
+    if not ok:  # the owner must always know what went wrong
+        try:
+            import autodl
+            asyncio.ensure_future(autodl._owner_dm(
+                f"❌ <b>VPS job failed</b> — {doc.get('series', '?')} "
+                f"Ep {doc.get('ep', '?')} "
+                f"[{doc.get('quality', '?')}]:\n"
+                f"<code>{escape_html(sets['error'])}</code>\n"
+                f"<i>Koyeb falls back to doing it itself.</i>"))
+        except Exception:
+            pass
     return True
 
 
@@ -152,6 +185,16 @@ async def start_health_server():
     health_app.router.add_get("/vps/job", vps_job_h)
     health_app.router.add_post("/vps/beat", vps_beat_h)
     health_app.router.add_post("/vps/report", vps_report_h)
+
+    async def vps_progress_h(request):
+        try:
+            p = await request.json()
+        except Exception:
+            p = {}
+        return web.json_response(
+            {"ok": await vps_progress(p.get("secret"), p)})
+
+    health_app.router.add_post("/vps/progress", vps_progress_h)
     runner = web.AppRunner(health_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
