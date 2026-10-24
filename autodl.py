@@ -836,6 +836,59 @@ def _free_up(need_mb=900):
         return 0
 
 
+VPS_JOB_TIMEOUT = 20 * 60
+
+
+async def _vps_archive(job, series, ep, q, url, db0, poster):
+    """Hand download+upload to the VPS worker. Returns the archive
+    Message in db0, or None so run_job falls back to Koyeb."""
+    import base64 as _b64
+    jid = secrets.token_hex(6)
+    doc = {"_id": jid, "status": "pending", "ts": time.time(),
+           "url": url, "channel": int(db0), "series": series,
+           "ep": ep, "quality": q,
+           "caption": f"{series} — Ep {ep} [{q}]",
+           "filename": f"{series} Eps {int(ep):02d} [{q}].mp4"}
+    if poster:
+        doc["thumb_b64"] = _b64.b64encode(
+            core_mod.thumb_16x9(poster) or b"").decode()
+    await store.col("vps_jobs").update_one({"_id": jid},
+                                           {"$set": doc},
+                                           upsert=True)
+    print(f"[autodl] VPS job {jid} queued: {series} Ep {ep} [{q}]")
+    deadline = time.time() + VPS_JOB_TIMEOUT
+    while time.time() < deadline:
+        if job.get("cancel"):
+            break
+        d = await store.find("vps_jobs", {"_id": jid})
+        d = d[0] if d else None
+        if not d:
+            return None
+        st = d.get("status")
+        if st == "done":
+            msg_id = (d.get("result") or {}).get("msg_id")
+            sent = None
+            try:
+                sent = await app.get_messages(int(db0), ids=msg_id)
+            except Exception:
+                sent = None
+            await store.col("vps_jobs").delete_one({"_id": jid})
+            if sent:
+                return sent
+            print(f"[autodl] VPS done but message missing "
+                  f"({db0}/{msg_id}) — falling back")
+            return None
+        if st == "failed":
+            print("[autodl] VPS job failed:",
+                  str(d.get("error"))[:140])
+            await store.col("vps_jobs").delete_one({"_id": jid})
+            return None
+        await asyncio.sleep(3)
+    await store.col("vps_jobs").delete_one({"_id": jid})
+    print("[autodl] VPS job timed out / cancelled — Koyeb takes over")
+    return None
+
+
 async def run_job(group, item, ep, stream, db_ids, poster):
     """One queued file: download (with live progress + cancel),
     archive in every DB channel (with upload progress), register."""
@@ -852,15 +905,28 @@ async def run_job(group, item, ep, stream, db_ids, poster):
     fname = f"{norm}_{ep}_{q}.mp4".replace(" ", "_")
     path = os.path.join(DOWNLOAD_DIR, fname)
     try:
-        if not _disk_ok(0):
-            _free_up(900)
-        if not _disk_ok(0):
-            job["status"] = "failed"
-            job["error"] = "disk low"
-            print("[autodl] disk low — skipping", fname)
-            return job
-        await download_stream(stream["url"], path, job)
-        size = os.path.getsize(path)
+        vps_sent = None
+        vps = await core_mod.vps_state()
+        if vps.get("enabled") and vps.get("online"):
+            vps_sent = await _vps_archive(job, series, ep, q,
+                                          stream["url"], db_ids[0],
+                                          poster)
+        if vps_sent is None:
+            if not _disk_ok(0):
+                _free_up(900)
+            if not _disk_ok(0):
+                job["status"] = "failed"
+                job["error"] = "disk low"
+                print("[autodl] disk low — skipping", fname)
+                return job
+            await download_stream(stream["url"], path, job)
+            size = os.path.getsize(path)
+        else:
+            size = getattr(getattr(vps_sent, "file", None),
+                           "size", 0) or 0
+            print(f"[autodl] VPS archived {series} Ep {ep} [{q}] → "
+                  f"{db_ids[0]} msg {vps_sent.id} "
+                  f"({human_size(size)})")
         job["phase"] = "upload"
 
         async def up_cb(sent_bytes, total_bytes):
@@ -879,7 +945,16 @@ async def run_job(group, item, ep, stream, db_ids, poster):
             x for x in _va if isinstance(x, DocumentAttributeVideo)]
         thumb16 = core_mod.thumb_16x9(poster)
         primary = None  # first DB channel gets the real upload
-        for dbc in db_ids:  # archive in every DB channel
+        if vps_sent is not None:
+            primary = vps_sent
+            refs.append({
+                "channel": int(vps_sent.chat_id),
+                "msg_id": vps_sent.id,
+                "link": await file_link(int(vps_sent.chat_id),
+                                        vps_sent.id),
+                "doc": _doc_ref(vps_sent.document
+                                or vps_sent.video)})
+        for dbc in (db_ids[1:] if vps_sent else db_ids):
             sent = None
             for attempt in (1, 2, 3):  # transient upload errors retry
                 try:

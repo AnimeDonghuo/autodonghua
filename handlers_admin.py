@@ -15,6 +15,8 @@ Admin / owner commands.
 import asyncio
 import json
 import os
+import secrets
+import time
 
 from telethon import events, utils
 from telethon.tl.custom import Button
@@ -25,7 +27,8 @@ from backup import backup_filename, backup_summary, load_backup, write_backup
 from config import BACKUP_DIR, CONFIG, save_config
 from core import (app, get_pass, is_owner, login, logout,
                   require_staff, resolve_channel, store, wait_for,
-                  flood_respond, flood_edit, flood_send_file)
+                  flood_respond, flood_edit, flood_send_file,
+                  vps_state)
 from parser import normalize_key
 from style import ADMIN_HOME, escape_html
 
@@ -277,6 +280,100 @@ async def cmd_setowner(e):
     await flood_respond(e, f"👑 <b>Owner set</b> to <code>{e.sender_id}</code> — "
                     f"progress panels &amp; batch reports will be "
                     f"DM'd to you.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/addvps(?:\s+(.+))?$"))
+async def cmd_addvps(e):
+    """Register a VPS download+upload worker (a SECOND bot token —
+    never the main bot: two sessions on one token split updates)."""
+    if not await is_owner(e.sender_id):
+        return await flood_respond(e, "👑 Owner only.")
+    parts = (e.text or "").split(None, 1)
+    args = parts[1].split() if len(parts) > 1 else []
+    if not args:
+        return await flood_respond(
+            e, "🖥 <b>Usage:</b> /addvps &lt;worker bot token&gt; "
+               "[koyeb base url]\n\nThe worker is a <b>second bot</b> "
+               "from @BotFather, added as admin in every DB channel — "
+               "never the main bot token.", parse_mode="html")
+    v = dict(await store.get_config("vps") or {})
+    base = (args[1].strip().rstrip("/") if len(args) > 1
+            else v.get("base") or "")
+    v.update({"token": args[0].strip(), "base": base,
+              "secret": v.get("secret") or secrets.token_hex(8),
+              "enabled": False, "beat": 0,
+              "jobs": v.get("jobs") or 0, "bytes": v.get("bytes") or 0})
+    await store.set_config("vps", v)
+    raw = ("https://raw.githubusercontent.com/AnimeDonghuo/"
+           "autodonghua/arena/25bec0bc-autodonghua")
+    await flood_respond(
+        e,
+        "🖥 <b>VPS worker registered</b> (off until /vps on).\n\n"
+        "1️⃣ Add the worker bot as <b>admin</b> in every DB channel.\n"
+        "2️⃣ On the VPS run:\n"
+        f"<code>curl -sL {raw}/vps_setup.sh -o s.sh && "
+        f"bash s.sh {base or 'https://YOUR-APP.koyeb.app'} "
+        f"{v['secret']}</code>\n"
+        "<i>The script auto-checks & installs python3 ≥ 3.7, "
+        "telethon, Pillow, hachoir (Debian 10+).</i>\n"
+        "3️⃣ When the worker heartbeats: /vps on",
+        parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/vps(?:\s+(on|off))?$"))
+async def cmd_vps(e):
+    """Show / toggle the VPS mode: ON = VPS downloads+uploads and
+    Koyeb only posts; OFF = Koyeb handles everything alone."""
+    if not await is_owner(e.sender_id):
+        return await flood_respond(e, "👑 Owner only.")
+    v = dict(await store.get_config("vps") or {})
+    if not v.get("secret"):
+        return await flood_respond(e, "🖥 No VPS registered — "
+                                      "/addvps first.")
+    arg = e.pattern_match.group(1)
+    if arg:
+        v["enabled"] = (arg == "on")
+        await store.set_config("vps", v)
+    st = await vps_state()
+    beat = time.time() - (st.get("beat") or 0)
+    caps = st.get("caps") or {}
+    yes = lambda k: "✓" if caps.get(k) else "✗"
+    lines = [
+        "🖥 <b>VPS worker</b>",
+        f"Mode: <b>{'ON' if st.get('enabled') else 'OFF'}</b> — "
+        + ("VPS downloads+uploads, Koyeb posts cards"
+           if st.get("enabled") else
+           "Koyeb handles everything, no VPS"),
+        f"Worker: <b>{'online' if st.get('online') else 'OFFLINE'}</b>"
+        + (f" (beat {int(beat)}s ago)" if st.get("beat") else ""),
+        f"Caps: py {caps.get('py', '?')} · telethon {yes('telethon')} "
+        f"· Pillow {yes('PIL')} · hachoir {yes('hachoir')} · disk "
+        f"{caps.get('disk_mb', '?')} MB",
+        f"Done: <b>{st.get('jobs') or 0}</b> job(s) · "
+        f"<b>{round((st.get('bytes') or 0) / 1073741824, 2)} GB</b> "
+        f"uploaded · avg {st.get('speed') or 0} MB/s",
+        f"Base: <code>{escape_html(st.get('base') or 'not set')}</code>",
+    ]
+    if st.get("enabled") and not st.get("online"):
+        lines.append("⚠️ ON but worker offline — jobs automatically "
+                     "fall back to Koyeb.")
+    await flood_respond(e, "\n".join(lines), parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/removevps$"))
+async def cmd_removevps(e):
+    if not await is_owner(e.sender_id):
+        return await flood_respond(e, "👑 Owner only.")
+    await store.set_config("vps", {})
+    for d in await store.find("vps_jobs"):
+        try:
+            await store.col("vps_jobs").delete_one({"_id": d["_id"]})
+        except Exception:
+            pass
+    await flood_respond(
+        e, "🖥 <b>VPS worker removed</b> — Koyeb handles everything "
+           "again. On the VPS stop it with: "
+           "<code>pkill -f vps_worker.py</code>", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/mongos$"))

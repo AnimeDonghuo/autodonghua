@@ -34,6 +34,79 @@ bot_user = None  # set at startup (our own bot account)
 health_app = None
 
 
+# ------------------------------------------------------------------ #
+# VPS worker bridge: an off-site download+upload node that archives
+# files into the DB channel while Koyeb keeps the bot brain (cards,
+# posters, DMs, registry). The worker never logs in as the main bot.
+# ------------------------------------------------------------------ #
+VPS_BEAT_SECONDS = 90
+
+
+async def vps_state():
+    v = dict(await store.get_config("vps") or {})
+    v["online"] = bool(v.get("secret")) and \
+        (time.time() - (v.get("beat") or 0)) < VPS_BEAT_SECONDS
+    return v
+
+
+async def vps_beat(secret, caps=None):
+    v = dict(await store.get_config("vps") or {})
+    if not v.get("secret") or secret != v.get("secret"):
+        return False
+    v["beat"] = time.time()
+    if caps:
+        v["caps"] = caps
+    await store.set_config("vps", v)
+    return True
+
+
+async def vps_claim(secret):
+    v = dict(await store.get_config("vps") or {})
+    if not v.get("enabled") or not v.get("secret") \
+            or secret != v.get("secret"):
+        return None
+    docs = await store.find("vps_jobs", {"status": "pending"},
+                            limit=1, sort=[("ts", 1)])
+    if not docs:
+        return None
+    d = dict(docs[0])
+    await store.col("vps_jobs").update_one(
+        {"_id": d["_id"]},
+        {"$set": {"status": "running", "started": time.time()}})
+    return {"job": d,
+            "creds": {"api_id": CONFIG.get("api_id"),
+                      "api_hash": CONFIG.get("api_hash"),
+                      "token": v.get("token")}}
+
+
+async def vps_report(secret, payload):
+    v = dict(await store.get_config("vps") or {})
+    if not v.get("secret") or secret != v.get("secret"):
+        return False
+    jid = (payload or {}).get("job")
+    if not jid:
+        return False
+    ok = bool((payload or {}).get("ok"))
+    res = (payload or {}).get("result") or {}
+    sets = {"status": "done" if ok else "failed",
+            "finished": time.time()}
+    if ok:
+        sets["result"] = res
+        v["jobs"] = (v.get("jobs") or 0) + 1
+        v["bytes"] = (v.get("bytes") or 0) + int(res.get("size") or 0)
+        sp = float(res.get("speed") or 0)
+        if sp > 0:
+            n = v["jobs"]
+            v["speed"] = round(
+                ((float(v.get("speed") or 0) * (n - 1)) + sp) / n, 2)
+    else:
+        sets["error"] = str((payload or {}).get("error") or "")[:200]
+    await store.col("vps_jobs").update_one({"_id": jid},
+                                           {"$set": sets})
+    await store.set_config("vps", v)
+    return True
+
+
 async def start_health_server():
     """Serve a tiny health endpoint on $PORT (default 8000)."""
     global health_app
@@ -51,9 +124,34 @@ async def start_health_server():
             "uptime_s": round(time.time() - START_TS),
         })
 
+    async def vps_job_h(request):
+        secret = request.headers.get("X-VPS-Secret") or \
+            request.query.get("secret")
+        return web.json_response(await vps_claim(secret)
+                                 or {"job": None})
+
+    async def vps_beat_h(request):
+        try:
+            p = await request.json()
+        except Exception:
+            p = {}
+        return web.json_response(
+            {"ok": await vps_beat(p.get("secret"), p.get("caps"))})
+
+    async def vps_report_h(request):
+        try:
+            p = await request.json()
+        except Exception:
+            p = {}
+        return web.json_response(
+            {"ok": await vps_report(p.get("secret"), p)})
+
     health_app = web.Application()
     health_app.router.add_get("/", root)
     health_app.router.add_get("/health", root)
+    health_app.router.add_get("/vps/job", vps_job_h)
+    health_app.router.add_post("/vps/beat", vps_beat_h)
+    health_app.router.add_post("/vps/report", vps_report_h)
     runner = web.AppRunner(health_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
