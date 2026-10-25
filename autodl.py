@@ -41,7 +41,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
-BUILD = "2026-10-25-a"  # stamp shown in /status — proves deploy freshness
+BUILD = "2026-10-25-b"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300

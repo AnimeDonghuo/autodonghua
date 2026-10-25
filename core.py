@@ -98,6 +98,14 @@ async def vps_progress(secret, payload):
                            "total": int(payload.get("total") or 0),
                            "speed": float(payload.get("speed") or 0),
                            "ts": time.time()}}})
+    # a progress post IS proof of life — refresh the heartbeat too,
+    # so a worker deep inside a long job can never show OFFLINE
+    # (its own beat thread covers the gaps between progress posts)
+    try:
+        v["beat"] = time.time()
+        await store.set_config("vps", v)
+    except Exception:
+        pass
     return True
 
 

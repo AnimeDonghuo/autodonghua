@@ -20,6 +20,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -29,7 +30,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 
-WORKER_BUILD = "4"   # bump on EVERY worker change — the watchdog
+WORKER_BUILD = "5"   # bump on EVERY worker change — the watchdog
 #                    # auto-updates VPSes whose beat reports an older one
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -148,7 +149,7 @@ def download(url, path, job_id):
     with r, open(path, "wb") as fh:
         total = int(r.headers.get("Content-Length") or 0)
         while True:
-            chunk = r.read(1 << 20)
+            chunk = r.read(1 << 22)   # 4 MB reads — fewer syscalls
             if not chunk:
                 break
             fh.write(chunk)
@@ -213,12 +214,21 @@ def run_one(job, client):
             _COUNT["bytes"] = sent_bytes
             progress(jid, "upload", sent_bytes, total_bytes)
 
+        # explicit 512 KB parts (Telegram's max) — send_file's
+        # default picks 128/256 KB, which means 200–2800 SEQUENTIAL
+        # round-trips per file and caps throughput at ~part/RTT;
+        # 512 KB cuts the round-trips 4–8×, so the same pipe moves
+        # several times faster
+        up = client.upload_file(
+            path, part_size_kb=512, file_size=os.path.getsize(path),
+            progress_callback=up_cb)
+        if hasattr(up, "__await__"):    # belt & braces: never a coroutine
+            up = client.loop.run_until_complete(up)
         sent = client.send_file(
-            job["channel"], file=path,
+            job["channel"], file=up,
             caption=job.get("caption") or "",
             thumb=thumb, supports_streaming=True,
-            attributes=video_attrs(path, name),
-            progress_callback=up_cb)
+            attributes=video_attrs(path, name))
         if hasattr(sent, "__await__"):  # belt & braces: never a coroutine
             sent = client.loop.run_until_complete(sent)
         doc = sent.document or sent.video
@@ -240,6 +250,21 @@ def run_one(job, client):
             pass
 
 
+def _beat_loop():
+    """Heartbeat THREAD — the main loop cannot beat while run_one
+    blocks for minutes on a download/upload, so a long job used to
+    age the beat past Koyeb's 90 s freshness window and the worker
+    showed OFFLINE *while it was uploading* (and new dispatches
+    fell back to Koyeb for nothing). 45 s cadence keeps the beat
+    fresh through every phase of every job."""
+    while True:
+        try:
+            api("/vps/beat", {"secret": CFG["secret"], "caps": caps()})
+        except Exception:
+            pass
+        time.sleep(45)
+
+
 def main():
     global CFG
     if not os.path.exists(CFG_PATH):
@@ -251,6 +276,7 @@ def main():
     os.makedirs(DL, exist_ok=True)
     sweep(0)   # boot wipe: anything in dl/ is a leftover of a
                # killed run (SIGTERM/reboot never runs cleanup)
+    threading.Thread(target=_beat_loop, daemon=True).start()
     client = None
     log(f"worker starting → {CFG['base']}")
     while True:

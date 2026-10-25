@@ -719,6 +719,20 @@ async def _worker_autoupdate(st):
     have = str((st.get("caps") or {}).get("build") or "0")
     if not want or have == want:
         return
+    # NEVER restart a worker mid-job: since the heartbeat thread,
+    # 'online' stays true DURING downloads/uploads, so check the
+    # job queue — a claimed job or progress under 2 min old means
+    # 'come back next tick' (5 min), not 'pkill now'
+    try:
+        inflight = await store.find("vps_jobs", {})
+    except Exception:
+        inflight = []
+    now = time.time()
+    for d in inflight or []:
+        if d.get("status") == "running" or \
+                ((d.get("prog") or {}).get("ts") or 0) > now - 120:
+            print("[vps] worker is mid-job — auto-update waits a tick")
+            return
     ssh = st["ssh"]
     import autodl
     try:
