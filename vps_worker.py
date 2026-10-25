@@ -25,8 +25,11 @@ import random
 import sys
 import threading
 import time
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
+from urllib.parse import quote, unquote
 
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -105,92 +108,248 @@ def progress(job_id, phase, done, total):
     _COUNT["bytes"] = int(done or 0)
 
 
-def _dl_request(url, referer=False):
+API_ROOT = "https://api.parciv.workers.dev"
+MAX_RESUME = 400    # one resume per CDN cut — a host that drops the
+                    # connection every ~3 MB needs ~120 of them for a
+                    # 359 MB episode, so the cap must be way above
+                    # any real file-size / cut-size ratio
+STALL_LIMIT = 3     # attempts in a row adding ZERO bytes = dead link
+ERROR_CTYPES = ("text/html", "application/json", "text/plain",
+                "text/xml", "application/xml")
+
+
+class CdnError(Exception):
+    """A failure that resuming cannot fix on THIS url (dead link,
+    error page, HTTP status, a server that throws Range away). The
+    caller moves on to the next route to the very same file."""
+
+
+def _host_of(url):
+    """The host of a url — a failure message should name the SERVER
+    that misbehaved, not burn its characters on the long proxy link."""
+    m = re.match(r"https?://([^/]+)", url or "")
+    return m.group(1) if m else str(url)[:40]
+
+
+def stream_candidates(url):
+    """Every route to this one file, best first.
+
+    The API hands out Cloudflare-Worker PROXY links
+    (.../anime/stream?url=<encoded seedbox url>). A Worker cannot
+    forward the Range header (it is on Cloudflare's forbidden-header
+    list, and the cache drops it on a miss), so when that proxy cuts a
+    transfer after a few megabytes it serves the SAME first bytes
+    forever — that is the 'truncated download: 3062823/376614938 B'
+    job failure that kept killing 720p. The decoded seedbox url is
+    candidate 2: the file server itself answers Range with 206, so the
+    download can be CONTINUED instead of restarted from zero."""
+    out = [url]
+    m = re.search(r"/(?:anime|donghua)/stream\?url=([^&\s]+)",
+                  url or "")
+    if m:
+        try:
+            direct = unquote(m.group(1))
+        except Exception:
+            direct = ""
+        if direct.startswith("http") and direct not in out:
+            out.append(direct)
+    elif str(url).startswith("http"):
+        try:
+            for sec in ("anime", "donghua"):
+                p = "%s/%s/stream?url=%s" % (API_ROOT, sec,
+                                             quote(url, safe=""))
+                if p not in out:
+                    out.append(p)
+        except Exception:
+            pass
+    return out[:3]
+
+
+def _referer_for(url):
+    """Referer for the 403 retry: the CDN's own root for a direct
+    seedbox url, the API root for a proxy url."""
+    m = re.match(r"(https?://[^/]+)/", url or "")
+    if m and "parciv" not in m.group(1):
+        return m.group(1) + "/"
+    return API_ROOT + "/"
+
+
+def _dl_request(url, referer=False, have=0):
     """Browser headers — episode CDNs answer the bare
-    Python-urllib User-Agent with 403 Forbidden."""
+    Python-urllib User-Agent with 403 Forbidden — plus the Range
+    header that turns a cut transfer into a continuable one."""
     h = {"User-Agent": BROWSER_UA, "Accept": "*/*",
          "Accept-Language": "en-US,en;q=0.9"}
     if referer:
-        h["Referer"] = "https://api.parciv.workers.dev/"
+        h["Referer"] = _referer_for(url)
+    if have:
+        h["Range"] = "bytes=%d-" % have
     return urllib.request.Request(url, headers=h)
 
 
-def sweep(max_age_min=10):
-    """Disk hygiene — the VPS must outlive months of unattended
-    runs. This script is single-threaded, so between jobs NOTHING
-    in dl/ is active: every file older than max_age_min is an
-    orphan from a killed/crashed run and goes. Boot calls sweep(0)
-    — a SIGTERM or reboot mid-download can't run finally blocks,
-    so startup wipes the folder outright. worker.log is capped too
-    (the shell redirect appends, so truncating is safe — the fd
-    keeps writing at the new EOF)."""
-    now = time.time()
-    try:
-        for f in os.listdir(DL):
-            p = os.path.join(DL, f)
-            try:
-                if os.path.isfile(p) and \
-                        now - os.path.getmtime(p) >= max_age_min * 60:
-                    os.remove(p)
-                    log("sweep: removed orphan", f)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        lp = os.path.join(HERE, "worker.log")
-        if os.path.getsize(lp) > 4 * 1048576:
-            with open(lp, "r+") as fh:
-                fh.truncate(0)
-            log("sweep: worker.log truncated (>4 MB)")
-    except Exception:
-        pass
-
-
 def download(url, path, job_id):
+    """Fetch + validate one episode file. Every route (proxy link,
+    then the direct seedbox url behind it) gets a FULL resume loop,
+    and the file is only returned when it is COMPLETE and big enough
+    to be a video — a truncated transfer is one more request now, not
+    a failed job."""
     t0 = time.time()
-    done = 0
-    r = None
-    for referer in (False, True):   # 403 → retry once with a referer
+    errs = []
+    best = 0
+    for cand in stream_candidates(url):
         try:
-            r = urllib.request.urlopen(_dl_request(url, referer),
-                                       timeout=120)
-            break
-        except urllib.error.HTTPError as ex:
-            if ex.code in (401, 403, 451) and not referer:
-                log("download HTTP", ex.code, "— retrying with "
-                    "referer headers")
-                continue
+            done = _download_route(cand, path, job_id)
+            secs = max(0.25, time.time() - t0)
+            return done, done / secs / 1048576   # bytes, MB/s
+        except Exception as exc:
+            have = os.path.getsize(path) if os.path.exists(path) else 0
+            if have > best:
+                best = have
+            errs.append("%s: %s" % (_host_of(cand), repr(exc)[:120]))
+            log("download route failed:", cand[:70], "-",
+                repr(exc)[:140])
+            try:
+                os.remove(path)   # the next route can be a different
+            except Exception:     # host/encode — never append to
+                pass              # somebody else's bytes
+    raise RuntimeError("every CDN route failed (best %d MB on disk): %s"
+                       % (best // 1048576, " | ".join(errs)[:220]))
+
+
+def _download_route(url, path, job_id):
+    """ONE candidate url: resume from the bytes on disk until the file
+    is complete, or until the server proves it cannot be continued.
+    Returns the byte count."""
+    import http.client
+    referer = False
+    resumes = 0
+    stalls = 0
+    while True:
+        have = os.path.getsize(path) if os.path.exists(path) else 0
+        done, total, cut, ignored = have, 0, None, False
+        r = None
+        try:
+            try:
+                r = urllib.request.urlopen(
+                    _dl_request(url, referer, have), timeout=180)
+            except urllib.error.HTTPError as ex:
+                if ex.code in (401, 403, 451) and not referer:
+                    log("download HTTP", ex.code,
+                        "— retrying with referer headers")
+                    referer = True
+                    continue
+                if ex.code == 416:
+                    rng = ""
+                    try:
+                        rng = ex.headers.get("Content-Range") or ""
+                    except Exception:
+                        rng = ""
+                    tot = int(rng.split("/")[-1]) if "/" in rng else 0
+                    if tot and have >= tot and have >= MIN_VIDEO_BYTES:
+                        _COUNT["bytes"] = have
+                        progress(job_id, "download", have, have)
+                        return have
+                    raise CdnError("HTTP 416 with %d B on disk "
+                                   "(server size %d B)" % (have, tot))
+                raise CdnError("HTTP %s" % ex.code)
+            code = getattr(r, "status", 0) or r.getcode()
+            # dead CDN links (they expire constantly) often answer
+            # HTTP 200 with a tiny text/html error PAGE — uploading
+            # that garbage poisoned the DB channel + episode cards,
+            # so every byte is validated BEFORE it can be archived
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if ctype.startswith(ERROR_CTYPES):
+                raise CdnError(
+                    "CDN served an error page (%s), not a video "
+                    "— the link is dead" % ctype)
+            if code == 206 and have:
+                mode = "ab"       # partial content: APPEND
+                rng = r.headers.get("Content-Range") or ""
+                total = int(rng.split("/")[-1]) if "/" in rng else 0
+            elif code == 200:
+                mode, done = "wb", 0
+                total = int(r.headers.get("Content-Length") or 0)
+                ignored = bool(have)   # our Range was thrown away
+            else:
+                raise CdnError("HTTP %s" % code)
+            with open(path, mode) as fh:
+                while True:
+                    try:
+                        chunk = r.read(1 << 22)   # 4 MB reads
+                    except http.client.IncompleteRead as ex:
+                        chunk = getattr(ex, "partial", b"") or b""
+                        cut = ex
+                        if total and done + len(chunk) > total:
+                            chunk = chunk[:max(0, total - done)]
+                        if chunk:
+                            fh.write(chunk)
+                            done += len(chunk)
+                        break
+                    except Exception as ex:   # reset / stall / EOF
+                        cut = ex
+                        break
+                    if not chunk:
+                        # urllib hands back a CLEAN b"" when the
+                        # server closes early on a length-encoded
+                        # body — that silent EOF was the "only a few
+                        # MBs downloaded" mystery
+                        break
+                    if total and done + len(chunk) > total:
+                        # never write past the DECLARED size — an
+                        # overshooting body would be archived as a
+                        # corrupt "video"
+                        chunk = chunk[:max(0, total - done)]
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    done += len(chunk)
+                    _COUNT["bytes"] = done
+                    progress(job_id, "download", done, total)
+        except CdnError:
             raise
-    with r, open(path, "wb") as fh:
-        # dead CDN links (the API's expire constantly) often answer
-        # HTTP 200 with a tiny text/html error PAGE — uploading
-        # that garbage poisoned the DB channel + episode cards, so
-        # every byte is validated BEFORE it can be archived
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        if ctype.startswith(("text/html", "application/json",
-                             "text/plain", "text/xml",
-                             "application/xml")):
-            raise RuntimeError(
-                f"CDN served an error page ({ctype}), not a video "
-                "— the link is dead")
-        total = int(r.headers.get("Content-Length") or 0)
-        while True:
-            chunk = r.read(1 << 22)   # 4 MB reads — fewer syscalls
-            if not chunk:
-                break
-            fh.write(chunk)
-            done += len(chunk)
-            _COUNT["bytes"] = done
-            progress(job_id, "download", done, total)
-    if total and done < total:
-        raise RuntimeError(f"truncated download: {done}/{total} B")
-    if done < MIN_VIDEO_BYTES:
-        raise RuntimeError(
-            f"file is only {done} B — no episode is that small; "
-            "dead CDN link (error page body)")
-    secs = max(0.25, time.time() - t0)
-    return done, done / secs / 1048576  # bytes, MB/s
+        finally:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+        _COUNT["bytes"] = done
+        progress(job_id, "download", done, total)
+        if total and done >= total:
+            if done < MIN_VIDEO_BYTES:
+                raise CdnError("file is only %d B — no episode is "
+                               "that small" % done)
+            return done
+        if not total and cut is None:
+            if done >= MIN_VIDEO_BYTES:
+                return done     # chunked, no length: trust the EOF
+            raise CdnError("file is only %d B — no episode is that "
+                           "small" % done)
+        if ignored:
+            raise CdnError(
+                "server ignored Range (answered 200 for bytes=%d-) "
+                "and cut at %d/%s B — this route can never be "
+                "resumed" % (have, done, total or "?"))
+        if total and total < MIN_VIDEO_BYTES:
+            raise CdnError("server says the whole file is %d B — no "
+                           "episode is that small" % total)
+        if done > have:
+            stalls = 0
+            resumes += 1
+            if resumes > MAX_RESUME:
+                raise CdnError("CDN cut the transfer %d times and "
+                               "still only %d/%d B landed"
+                               % (resumes, done, total))
+            log("resume", resumes, "-", done, "/", total, "B",
+                ("(%s)" % repr(cut)[:60]) if cut else "(server EOF)")
+            time.sleep(0.25)
+            continue
+        stalls += 1
+        if stalls >= STALL_LIMIT:
+            raise CdnError("CDN made no progress %dx at %d/%d B (%s)"
+                           % (stalls, done, total,
+                              repr(cut)[:80] if cut else "clean EOF"))
+        time.sleep(1.0 * stalls)
 
 
 PART_SIZE = 512 * 1024        # Telegram's maximum upload part

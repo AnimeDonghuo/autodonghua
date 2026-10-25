@@ -983,10 +983,26 @@ async def vps_watchdog_loop():
             # the 20-min VPS_JOB_TIMEOUT at the latest, so anything
             # older was orphaned by a redeploy/crash — and a leftover
             # 'running' doc used to defer the worker auto-update
-            # forever (how a VPS froze on an ancient build)
+            # forever (how a VPS froze on an ancient build).
+            # PROGRESS-AWARE: a big 720p/1080p on a CDN that cuts
+            # every connection legitimately runs far longer than
+            # 25 min (the poller keeps extending its own deadline
+            # while reports flow), and purging its doc mid-flight
+            # made Koyeb re-download + DOUBLE-archive the episode —
+            # so only a doc whose worker has been SILENT for 5 min
+            # counts as a zombie.
             try:
                 zq = {"ts": {"$lt": time.time() - 25 * 60}}
                 for zd in await store.find("vps_jobs", zq) or []:
+                    prog = zd.get("prog") or {}
+                    if prog and (time.time()
+                                 - float(prog.get("ts") or 0)) \
+                            < 5 * 60:
+                        # the worker reported progress less than 5 min
+                        # ago — it is ALIVE on a big file, not a
+                        # zombie. Filtered in Python so it behaves the
+                        # same on Mongo and the local fallback.
+                        continue
                     await store.col("vps_jobs").delete_one(
                         {"_id": zd["_id"]})
                     print("[vps] purged zombie job doc",

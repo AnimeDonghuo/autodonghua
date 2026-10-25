@@ -41,7 +41,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
-BUILD = "2026-10-25-g"  # stamp shown in /status — proves deploy freshness
+BUILD = "2026-10-25-h"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
@@ -677,92 +677,251 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 
 MIN_VIDEO_BYTES = 1024 * 1024   # no episode video is ever smaller —
                                 # a 3 KB "video" is a CDN error page
+# Content-Types that are NEVER a video: a dead CDN link answers HTTP
+# 200 with one of these tiny error bodies.
+ERROR_CTYPES = ("text/html", "application/json", "text/plain",
+                "text/xml", "application/xml")
+MAX_RESUME = 400    # hosts that drop every connection after a few MB
+                    # need ONE resume per cut — a 359 MB episode cut
+                    # every ~3 MB is ~120 of them, so the cap has to
+                    # be far above any sane file size / cut size
+STALL_LIMIT = 3     # attempts in a row that add ZERO bytes = dead
+
+
+class _CdnError(RuntimeError):
+    """A download failure that RESUMING cannot fix on this url: dead
+    link, error-page body, HTTP status, a server that throws Range
+    away. Abandons ONE candidate route so download_stream can try the
+    next way of reaching the very same file."""
+
+
+def _referer_for(url: str) -> str:
+    """Referer for the 403 retry: the CDN's own root for a direct
+    seedbox url, the API root for a proxy url."""
+    m = re.match(r"(https?://[^/]+)/", url or "")
+    if m and "parciv" not in m.group(1):
+        return m.group(1) + "/"
+    return API_ROOT + "/"
+
+
+def _host_of(url: str) -> str:
+    """The host of a url — error messages name the SERVER that
+    misbehaved instead of wasting their 200 characters on the
+    (very long) proxy link."""
+    m = re.match(r"https?://([^/]+)", url or "")
+    return m.group(1) if m else str(url)[:40]
+
+
+def stream_candidates(url: str):
+    """Every route to this one file, best first.
+
+    The API hands out Cloudflare-Worker PROXY links
+    (…/anime/stream?url=<encoded seedbox url>). A Worker is not
+    allowed to forward the Range header (it is on Cloudflare's
+    forbidden-header list, and the cache drops it on a miss too), so
+    when that proxy cuts a transfer after a few megabytes it serves
+    the SAME first bytes forever — exactly the
+    'truncated download: 3062823/376614938 B' failure that kept
+    killing 720p. The decoded seedbox url is candidate 2: the file
+    server itself answers Range with 206, so the download can
+    actually be CONTINUED instead of restarted. A direct url handed
+    to us gets the proxy forms as its fallbacks."""
+    out = [url]
+    m = re.search(r"/(?:anime|donghua)/stream\?url=([^&\s]+)",
+                  url or "")
+    if m:
+        try:
+            from urllib.parse import unquote
+            direct = unquote(m.group(1))
+        except Exception:
+            direct = ""
+        if direct.startswith("http") and direct not in out:
+            out.append(direct)
+    elif str(url).startswith("http"):
+        try:
+            from urllib.parse import quote
+            for sec in ("anime", "donghua"):
+                p = "%s/%s/stream?url=%s" % (API_ROOT, sec,
+                                             quote(url, safe=""))
+                if p not in out:
+                    out.append(p)
+        except Exception:
+            pass
+    return out[:3]
 
 
 async def download_stream(url: str, dest: str, job=None) -> str:
-    """Download with HTTP-range RESUME: a restart mid-file picks up
-    from the bytes already on disk instead of starting over.
+    """Download one episode file — ROUTED, RESUMED, VALIDATED.
 
-    Sent with real browser headers — episode CDNs answer a bare
-    python/aiohttp User-Agent with 403 Forbidden — and a 403 is
-    retried once with a Referer before giving up.
+    Three layers, because the CDNs behind the API are hostile:
+      1. ROUTES — the proxy link first, the direct seedbox url it
+         hides behind second (stream_candidates);
+      2. RESUME — a route that cuts the connection after a few MB is
+         re-requested with ``Range: bytes=<bytes on disk>-`` and the
+         new bytes are APPENDED, over and over (up to MAX_RESUME)
+         until the file is complete. A cut is not a failure any more;
+         it is one more request. A restart mid-download still
+         continues from the bytes already on disk.
+      3. VALIDATE — an error-page Content-Type, a body that cannot be
+         continued, or anything under MIN_VIDEO_BYTES raises instead
+         of being archived as a 'video' and wired into episode cards.
+    Every failure ends up VISIBLE (panel feedback + log), never as a
+    3 MB 'episode'."""
+    errors = []
+    best = 0
+    for cand in stream_candidates(url):
+        try:
+            return await _download_route(cand, dest, job)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            have = os.path.getsize(dest) if os.path.exists(dest) else 0
+            best = max(best, have)
+            errors.append(f"{_host_of(cand)}: {repr(exc)[:110]}")
+            print(f"[autodl] download route failed ({cand[:90]}): "
+                  f"{repr(exc)[:160]}")
+            try:
+                os.remove(dest)   # the next route can be a different
+            except Exception:     # host/encode — never continue
+                pass              # somebody else's bytes
+    raise RuntimeError(
+        f"every CDN route failed ({len(errors)} tried, most got to "
+        f"{human_size(best) or '0 B'}): " + " | ".join(errors)[:240])
 
-    VALIDATED: dead CDN links (the API's 720p ones expire a lot)
-    often answer HTTP 200 with a tiny text/html error PAGE — that
-    garbage used to be archived as a 'video' and wired into the
-    episode card. An error-page content-type, a truncated body or
-    anything under MIN_VIDEO_BYTES now raises instead, so the file
-    gets a fresh url or fails VISIBLY — never poisoned."""
-    have = os.path.getsize(dest) if os.path.exists(dest) else 0
+
+async def _download_route(url: str, dest: str, job=None) -> str:
+    """ONE candidate url: keep resuming from the bytes on disk until
+    the file is complete, or until the server proves the transfer
+    cannot be continued."""
     s, _ = http_session(900)
     # total=None: a big 720p/1080p file on a slow line can take far
-    # longer than any fixed TOTAL timeout — the old 900 s total cap
-    # killed large transfers mid-file (part of the "720p issue").
-    # Bound the STALL instead: 180 s without a single byte = dead
-    # transfer, but a slow-yet-moving one may run as long as needed.
+    # longer than any fixed TOTAL timeout — the old 900 s cap killed
+    # large transfers mid-file. Bound the STALL instead: 180 s
+    # without a single byte is a dead transfer, but slow-yet-moving
+    # may run as long as it needs.
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30,
                                     sock_read=180)
     loop = asyncio.get_running_loop()
-    last_status = 0
-    for extra in ({}, {"Referer": "https://api.parciv.workers.dev/"}):
+    referer = False
+    resumes = 0
+    stalls = 0
+    while True:
+        have = os.path.getsize(dest) if os.path.exists(dest) else 0
         headers = {"User-Agent": BROWSER_UA, "Accept": "*/*",
                    "Accept-Language": "en-US,en;q=0.9"}
-        headers.update(extra)
+        if referer:
+            headers["Referer"] = _referer_for(url)
         if have:
             headers["Range"] = f"bytes={have}-"
-        async with s.get(url, headers=headers, timeout=timeout) as r:
-            last_status = r.status
-            if r.status in (401, 403, 451):
-                print(f"[autodl] download HTTP {r.status} — retrying "
-                      f"with referer headers: {url[:90]}")
-                continue
-            if r.status == 206 and have:  # partial content: append
-                mode = "ab"
-                rng = r.headers.get("Content-Range", "")
-                total = int(rng.split("/")[-1]) if "/" in rng else 0
-                done = have
-            elif r.status == 200:
-                mode = "wb"
-                total = int(r.headers.get("Content-Length") or 0)
-                done = 0
-            else:
-                raise RuntimeError(f"HTTP {r.status}")
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            if ctype.startswith(("text/html", "application/json",
-                                 "text/plain", "text/xml",
-                                 "application/xml")):
-                raise RuntimeError(
-                    f"CDN served an error page ({ctype}, HTTP "
-                    f"{r.status}), not a video — the link is dead")
-            if job is not None:
-                job["total"] = total
-            last = time.time()
-            last_done = done
-            with open(dest, mode) as f:
-                async for chunk in r.content.iter_chunked(1 << 20):
-                    if job is not None and job["cancel"]:
-                        raise JobCancelled()
-                    # disk write off the event loop: the bot keeps
-                    # answering users while multi-GB files land
-                    await loop.run_in_executor(None, f.write, chunk)
-                    done += len(chunk)
-                    if job is not None:
-                        job["done"] = done
-                        now = time.time()
-                        if now - last >= 1.0:
-                            job["speed"] = ((done - last_done)
-                                            / (now - last))
-                            last, last_done = now, done
-            if total and done < total:
-                raise RuntimeError(f"truncated download: {done}/"
-                                   f"{total} bytes — CDN dropped it")
+        done, total, cut, ignored = have, 0, None, False
+        try:
+            async with s.get(url, headers=headers, timeout=timeout) as r:
+                status = r.status
+                if status in (401, 403, 451) and not referer:
+                    print(f"[autodl] download HTTP {status} — retrying "
+                          f"with referer headers: {url[:90]}")
+                    referer = True
+                    continue
+                if status == 416:
+                    # Range Not Satisfiable — the bytes on disk reach
+                    # past the end of the real file: complete when the
+                    # server names the size, junk otherwise
+                    rng = r.headers.get("Content-Range") or ""
+                    tot = int(rng.split("/")[-1]) if "/" in rng else 0
+                    if tot and have >= tot \
+                            and have >= MIN_VIDEO_BYTES:
+                        if job is not None:
+                            job["done"] = job["total"] = have
+                        return dest
+                    raise _CdnError(f"HTTP 416 with {have} B on disk "
+                                    f"(server size {tot} B)")
+                if status == 206 and have:
+                    mode = "ab"          # partial content: APPEND
+                    rng = r.headers.get("Content-Range") or ""
+                    total = int(rng.split("/")[-1]) if "/" in rng else 0
+                elif status == 200:
+                    mode, done = "wb", 0
+                    total = int(r.headers.get("Content-Length") or 0)
+                    ignored = bool(have)   # our Range was thrown away
+                else:
+                    raise _CdnError(f"HTTP {status}")
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if ctype.startswith(ERROR_CTYPES):
+                    raise _CdnError(
+                        f"CDN served an error page ({ctype}, HTTP "
+                        f"{status}), not a video — the link is dead")
+                if job is not None and total:
+                    job["total"] = total
+                last = time.time()
+                last_done = done
+                with open(dest, mode) as f:
+                    async for chunk in r.content.iter_chunked(1 << 20):
+                        if job is not None and job["cancel"]:
+                            raise JobCancelled()
+                        if total and done + len(chunk) > total:
+                            # never write past the size the server
+                            # DECLARED: an overshooting body (or a
+                            # bogus resume offset) would otherwise be
+                            # archived as a corrupt "video"
+                            chunk = chunk[:max(0, total - done)]
+                        if not chunk:
+                            break
+                        # disk write off the event loop: the bot keeps
+                        # answering users while multi-GB files land
+                        await loop.run_in_executor(None, f.write, chunk)
+                        done += len(chunk)
+                        if job is not None:
+                            job["done"] = done
+                            now = time.time()
+                            if now - last >= 1.0:
+                                job["speed"] = ((done - last_done)
+                                                / (now - last))
+                                last, last_done = now, done
+        except (JobCancelled, _CdnError):
+            raise
+        except Exception as exc:
+            # connection reset, payload cut, socket stall: everything
+            # already written stays on disk, so this IS resumable
+            cut = exc
+        if total and done >= total:
             if done < MIN_VIDEO_BYTES:
-                raise RuntimeError(
+                raise _CdnError(
                     f"file is only {done} B — no episode is that "
                     "small; dead CDN link (error page body)")
+            if job is not None:
+                job["done"], job["total"] = done, total
             return dest
-    raise RuntimeError(f"HTTP {last_status} (CDN blocked both header "
-                       f"flavours)")
+        if not total and cut is None:
+            if done >= MIN_VIDEO_BYTES:
+                return dest        # chunked, no length: trust the EOF
+            raise _CdnError(f"file is only {done} B — no episode is "
+                            "that small; dead CDN link")
+        if ignored:
+            raise _CdnError(
+                f"server ignored Range (answered 200 for "
+                f"bytes={have}-) and cut at {done}/"
+                f"{total or '?'} B — this route can never be resumed")
+        if total and total < MIN_VIDEO_BYTES:
+            raise _CdnError(f"server says the whole file is {total} B "
+                            "— no episode is that small; dead link")
+        if done > have:
+            stalls = 0
+            resumes += 1
+            if resumes > MAX_RESUME:
+                raise RuntimeError(
+                    f"CDN cut the transfer {resumes} times and still "
+                    f"only {done}/{total} B landed")
+            print(f"[autodl] resume {resumes}: {done}/"
+                  f"{total or '?'} B on disk "
+                  f"({repr(cut)[:60] if cut else 'server EOF'})")
+            await asyncio.sleep(0.25)
+            continue
+        stalls += 1
+        if stalls >= STALL_LIMIT:
+            raise RuntimeError(
+                f"CDN made no progress {stalls}× at {done}/{total} B "
+                f"({repr(cut)[:80] if cut else 'clean EOF'})")
+        await asyncio.sleep(1.0 * stalls)
 
 
 async def resolve_poster(item, series: str):
@@ -2289,17 +2448,19 @@ async def _search_episode(section: str, series: str, ep):
     return None
 
 
-async def refresh_stream_url(series, ep, quality, old_url=""):
-    """The API's CDN links expire (HTTP 404) while a long queue
-    works through its files. Re-query the search API and return the
-    CURRENT url for this exact series/ep/quality ('-eng' flavours
-    included), or None when the API no longer lists it."""
+async def refresh_stream_urls(series, ep, quality, old_url=""):
+    """EVERY current url the API lists for this exact series/ep/quality
+    ('-eng' flavours included), the ones that DIFFER from the dead url
+    first. CDN links expire constantly and the API can list several
+    hosts for one quality, so a retry must not be limited to whichever
+    url happened to come back first."""
     label = (quality or "").lower()
     eng = _has_eng(label)
     base = label.split("-")[0]
     if base.isdigit():
         base += "p"          # "360-eng" means "360p-eng"
     sections = ("anime", "donghua") if eng else ("donghua", "anime")
+    diff, same = [], []
     for section in sections:
         try:
             item = await _search_episode(section, series, ep)
@@ -2309,7 +2470,6 @@ async def refresh_stream_url(series, ep, quality, old_url=""):
             continue
         if not item:
             continue
-        same = ""
         for s in item.get("streams", []):
             q2 = (s.get("quality") or "").lower()
             b2 = q2.split("-")[0]
@@ -2320,42 +2480,75 @@ async def refresh_stream_url(series, ep, quality, old_url=""):
             url = s.get("url") or ""
             if not url:
                 continue
-            if url != old_url:
-                # the API can list several streams for one quality —
-                # when the one we had is dead, prefer a DIFFERENT one
-                print(f"[autodl] refreshed {quality} url for "
-                      f"{series} Ep {ep}")
-                return url
-            same = same or url
-        if same:
-            return same
-    return None
+            (same if url == old_url else diff).append(url)
+        if diff:
+            break
+    out = []
+    for u in diff + same:
+        if u not in out:
+            out.append(u)
+    if out:
+        print(f"[autodl] refreshed {quality} urls for {series} Ep {ep}"
+              f" — {len(out)} candidate(s)")
+    return out
+
+
+async def refresh_stream_url(series, ep, quality, old_url=""):
+    """The API's CDN links expire (HTTP 404 / cut transfers) while a
+    long queue works through its files. Re-query the search API and
+    return the CURRENT best url for this exact series/ep/quality, or
+    None when the API no longer lists it."""
+    urls = await refresh_stream_urls(series, ep, quality, old_url)
+    return urls[0] if urls else None
 
 
 async def _download_fresh(stream, path, job, series, ep, q):
-    """download_stream + ONE url refresh when the CDN answers
-    403/404 (stale link) — then retry with the fresh url."""
+    """download_stream (which already walks every route of one url:
+    proxy → direct seedbox, resuming each cut) PLUS fresh urls from
+    the API when a url is simply dead/expired — up to two of them,
+    each with its own full route+resume walk. Cancels propagate
+    instantly and the LAST real error is what surfaces."""
+    err = None
+    tried = [stream["url"]]
     try:
         await download_stream(stream["url"], path, job)
         return
     except JobCancelled:
         raise
-    except Exception:
-        # HTTP 403/404, an error-page body, a truncated or a
-        # too-small file, a stalled/dead connection — ALL of these
-        # mean the CDN link went bad, so re-query the API and retry
-        # ONCE with a fresh url before failing the file
-        fresh = await refresh_stream_url(series, ep, q, stream["url"])
-        if not fresh:
-            raise
-        print(f"[autodl] HTTP 403/404 → fresh url for {series} "
-              f"Ep {ep} [{q}] — retrying download")
+    except Exception as exc:
+        err = exc
+        print(f"[autodl] download failed ({repr(exc)[:150]}) — asking "
+              f"the API for fresh {q} urls")
+    fresh_urls = []
+    try:
+        fresh_urls = await refresh_stream_urls(series, ep, q,
+                                               stream["url"])
+    except Exception as exc:
+        print("[autodl] url refresh failed:", repr(exc)[:120])
+    for fresh in fresh_urls[:2]:
+        if fresh in tried:
+            continue
+        tried.append(fresh)
         stream["url"] = fresh
         try:
-            os.remove(path)
-        except Exception:
-            pass
-        await download_stream(fresh, path, job)
+            os.remove(path)   # another host = maybe another encode:
+        except Exception:     # start clean, never append to bytes
+            pass              # that came from a different server
+        print(f"[autodl] fresh url for {series} Ep {ep} [{q}] — "
+              f"retrying download")
+        try:
+            await download_stream(fresh, path, job)
+            return
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            err = exc
+            print(f"[autodl] fresh url failed too "
+                  f"({repr(exc)[:150]})")
+    if err is not None:
+        raise err
+    raise RuntimeError(f"no working CDN url for {series} Ep {ep} "
+                       f"[{q}] ({len(tried)} tried)")
 
 
 async def _eng_pending_pass(st) -> int:
