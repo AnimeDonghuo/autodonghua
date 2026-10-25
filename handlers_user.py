@@ -368,6 +368,7 @@ KNOWN_COMMANDS = {
     "status", "addmongo", "cancel",
     "addvps", "vps", "removevps", "searchad", "syncbutton", "setowner",
     "cancelall", "parallel", "fixsmall",
+    "quality", "qualityindo", "qualityeng",
 }
 
 

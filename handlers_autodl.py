@@ -337,14 +337,209 @@ async def cmd_parallel(e):
                         parse_mode="html")
 
 
+# ---------------------------------------------------------------------- #
+# /quality · /qualityindo · /qualityeng — which qualities may download
+# ---------------------------------------------------------------------- #
+QUALS = ["360p", "480p", "720p", "1080p"]
+QKIND = {"i": ("qualities", "INDO (base 360p…1080p)", "🇮🇩 Indo"),
+         "e": ("qualities_eng", "ENG (-eng flavours)", "🇬🇧 Eng")}
+
+
+async def _q_get(kind):
+    """(settings, key, current list, ticked set). An EMPTY list means
+    'all qualities' — the convention /autodl has always used."""
+    st = await autodl.get_settings()
+    key = QKIND[kind][0]
+    cur = [str(q).lower() for q in (st.get(key) or [])]
+    ticks = set(QUALS) if (not cur or "all" in cur) \
+        else {q for q in QUALS if q in cur}
+    return st, key, cur, ticks
+
+
+def _q_text(kind, cur, ticks):
+    allq = not cur or "all" in cur
+    lines = [f"🎞 <b>Download qualities — {QKIND[kind][1]}</b>", ""]
+    for q in QUALS:
+        lines.append(("✅ " if q in ticks else "⬜ ") + f"<b>{q}</b>")
+    lines += [
+        "",
+        ("🌐 Right now: <b>ALL</b> of them." if allq else
+         "🌐 Right now: <b>" + ", ".join(
+             q for q in QUALS if q in ticks) + "</b>"),
+        "",
+        "Unticked qualities are never downloaded, never archived and "
+        "never posted — for the watcher AND every /checknew, "
+        "/searchad, /syncbutton batch.",
+        "📌 Applies to <b>new</b> episodes from now on. Old episodes "
+        "are NOT re-downloaded for a quality you tick later — use "
+        "/searchad (one episode) or /syncbutton (eng sweep) when you "
+        "want that on purpose.",
+    ]
+    return "\n".join(lines)
+
+
+async def _q_render(kind):
+    st, key, cur, ticks = await _q_get(kind)
+    rows = []
+    for i in range(0, len(QUALS), 2):
+        rows.append([
+            Button.inline(
+                ("✅ " if q in ticks else "⬜ ") + q,
+                f"qsel:{kind}:{q}".encode())
+            for q in QUALS[i:i + 2]])
+    allq = not cur or "all" in cur
+    rows.append([Button.inline(
+        ("✅ " if allq else "⬜ ") + "🌐 All qualities",
+        f"qselall:{kind}".encode())])
+    rows.append([Button.inline("🔙 Back", f"qhub".encode()),
+                 Button.inline("✔️ Done", f"qseldone:{kind}".encode())])
+    return _q_text(kind, cur, ticks), rows
+
+
+@app.on(events.NewMessage(pattern=r"^/quality$"))
+async def cmd_quality(e):
+    """Owner/staff hub: pick which qualities may be downloaded."""
+    if not await require_staff(e):
+        return
+    st = await autodl.get_settings()
+
+    def show(sel):
+        sel = [str(q).lower() for q in (sel or [])]
+        return ("ALL" if (not sel or "all" in sel)
+                else ", ".join(q for q in QUALS if q in sel) or "none")
+    await flood_respond(
+        e, "🎞 <b>Download qualities</b>\n\n"
+           f"🇮🇩 Indo (base): <b>{show(st.get('qualities'))}</b>\n"
+           f"🇬🇧 Eng (-eng): <b>{show(st.get('qualities_eng'))}</b>\n\n"
+           "Tap one to choose exactly which qualities the bot may "
+           "download. It is saved and applies to the watcher and to "
+           "every batch from now on — a quality you never tick is "
+           "never fetched (no more doomed 720p jobs).\n\n"
+           "📌 New episodes only: ticking a quality later does NOT "
+           "drag old episodes back into the queue.",
+        parse_mode="html",
+        buttons=[[Button.inline("🇮🇩 Indo qualities", b"qopen:i"),
+                  Button.inline("🇬🇧 Eng qualities", b"qopen:e")]])
+
+
+@app.on(events.NewMessage(pattern=r"^/qualityindo$"))
+async def cmd_quality_indo(e):
+    if not await require_staff(e):
+        return
+    text, rows = await _q_render("i")
+    await flood_respond(e, text, parse_mode="html", buttons=rows)
+
+
+@app.on(events.NewMessage(pattern=r"^/qualityeng$"))
+async def cmd_quality_eng(e):
+    if not await require_staff(e):
+        return
+    text, rows = await _q_render("e")
+    await flood_respond(e, text, parse_mode="html", buttons=rows)
+
+
+@app.on(events.CallbackQuery(pattern=rb"qopen:([ie])"))
+async def cb_q_open(e):
+    if not await require_staff(e):
+        return
+    await e.answer()
+    kind = e.pattern_match.group(1).decode()
+    text, rows = await _q_render(kind)
+    await flood_edit(e, text, parse_mode="html", buttons=rows)
+
+
+@app.on(events.CallbackQuery(pattern=rb"qsel:([ie]):([\w\-]+)"))
+async def cb_q_toggle(e):
+    if not await require_staff(e):
+        return
+    kind = e.pattern_match.group(1).decode()
+    q = e.pattern_match.group(2).decode().lower()
+    if q not in QUALS:
+        return await e.answer("Unknown quality", alert=True)
+    st, key, cur, ticks = await _q_get(kind)
+    if q in ticks:
+        ticks.discard(q)
+        if not ticks:
+            return await e.answer(
+                "Keep at least one quality — or tap 🌐 All", alert=True)
+    else:
+        ticks.add(q)
+    new = [x for x in QUALS if x in ticks]
+    st[key] = [] if len(new) == len(QUALS) else new   # 4 ticks = ALL
+    await autodl.save_settings(st)
+    await e.answer(("✅ " if q in ticks else "⬜ ") + q +
+                   (" — removed" if q not in ticks else " — added"))
+    text, rows = await _q_render(kind)
+    await flood_edit(e, text, parse_mode="html", buttons=rows)
+
+
+@app.on(events.CallbackQuery(pattern=rb"qselall:([ie])"))
+async def cb_q_all(e):
+    if not await require_staff(e):
+        return
+    kind = e.pattern_match.group(1).decode()
+    st, key, cur, ticks = await _q_get(kind)
+    st[key] = []                      # empty = every quality offered
+    await autodl.save_settings(st)
+    await e.answer("🌐 All qualities")
+    text, rows = await _q_render(kind)
+    await flood_edit(e, text, parse_mode="html", buttons=rows)
+
+
+@app.on(events.CallbackQuery(pattern=rb"qseldone:([ie])"))
+async def cb_q_done(e):
+    if not await require_staff(e):
+        return
+    kind = e.pattern_match.group(1).decode()
+    st, key, cur, ticks = await _q_get(kind)
+    label = QKIND[kind][2]
+    shown = "ALL" if (not cur or "all" in cur) else ", ".join(
+        q for q in QUALS if q in ticks)
+    await e.answer("Saved")
+    await flood_edit(
+        e, f"✅ <b>{label} qualities saved: {escape_html(shown)}</b>\n\n"
+           "Every new download from now on obeys it — the watcher, "
+           "/checknew, /searchad and /syncbutton.\n"
+           "📌 Old episodes are NOT re-downloaded for a quality you "
+           "just ticked; /searchad does one episode on purpose.",
+        parse_mode="html", buttons=None)
+
+
+@app.on(events.CallbackQuery(pattern=rb"qhub$"))
+async def cb_q_hub(e):
+    if not await require_staff(e):
+        return
+    await e.answer()
+    st = await autodl.get_settings()
+
+    def show(sel):
+        sel = [str(q).lower() for q in (sel or [])]
+        return ("ALL" if (not sel or "all" in sel)
+                else ", ".join(q for q in QUALS if q in sel) or "none")
+    await flood_edit(
+        e, "🎞 <b>Download qualities</b>\n\n"
+           f"🇮🇩 Indo (base): <b>{show(st.get('qualities'))}</b>\n"
+           f"🇬🇧 Eng (-eng): <b>{show(st.get('qualities_eng'))}</b>\n\n"
+           "Tap one to choose exactly which qualities the bot may "
+           "download — saved, and applied to every new download.",
+        parse_mode="html",
+        buttons=[[Button.inline("🇮🇩 Indo qualities", b"qopen:i"),
+                  Button.inline("🇬🇧 Eng qualities", b"qopen:e")]])
+
+
 async def _status_head():
     """Shared /status header: the AutoDL block PLUS the VPS worker's
     own stats whenever one is registered — Koyeb side unchanged."""
     st = await autodl.get_settings()
     qs = st.get("qualities") or []
+    qe = st.get("qualities_eng") or []
+
+    def _qtxt(sel):
+        return "ALL" if not sel else ", ".join(sel)
     head = (f"🤖 <b>AutoDL:</b> {'🟢 on' if st.get('enabled') else '🔴 off'}"
             f" · every {st.get('interval', 20)} min\n"
-            f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
+            f"🎞 Qualities: 🇮🇩 {_qtxt(qs)} · 🇬🇧 {_qtxt(qe)} "
+            f"(/quality)\n"
             f"{autodl.telethon_info()} · build {autodl.BUILD}\n")
     w = await store.get_config("watch") or {}
     if w.get("ts"):

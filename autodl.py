@@ -17,6 +17,7 @@ API lists episodes 1 and 2, only episode 2 is downloaded.
 import asyncio
 import base64
 import io
+import json
 import os
 import re
 import resource
@@ -41,7 +42,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
-BUILD = "2026-10-25-h"  # stamp shown in /status — proves deploy freshness
+BUILD = "2026-10-25-i"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
@@ -140,13 +141,32 @@ async def get_settings():
         # anime is watched now — migrate saved single-section configs
         st["sections"] = list(DEFAULT_SECTIONS)
         await save_settings(st)
+    # eng flavours got their own selector (/qualityeng): before it
+    # existed ONE list ruled both, so an unset eng list mirrors the
+    # indo one instead of silently switching eng downloads to "all"
+    qse = st.get("qualities_eng")
+    if qse is None:
+        qse = list(qs)
     return {
         "enabled": bool(st.get("enabled")),
         "qualities": qs,
+        "qualities_eng": qse,
         "sections": st.get("sections") or list(DEFAULT_SECTIONS),
         "interval": int(st.get("interval") or 20),
         "last_ids": st.get("last_ids") or [],
     }
+
+
+def base_quality(label) -> str:
+    """'720p-eng' / '720-eng' / '720p' → '720p'."""
+    b = (label or "").lower().split("-")[0]
+    return b + "p" if b.isdigit() else b
+
+
+def _sel_ok(base: str, selected) -> bool:
+    """Empty list / 'all' = every quality the API offers."""
+    want = {str(q).lower() for q in (selected or [])}
+    return (not want) or ("all" in want) or (base in want)
 
 
 async def save_settings(st):
@@ -780,31 +800,374 @@ async def download_stream(url: str, dest: str, job=None) -> str:
             errors.append(f"{_host_of(cand)}: {repr(exc)[:110]}")
             print(f"[autodl] download route failed ({cand[:90]}): "
                   f"{repr(exc)[:160]}")
-            try:
-                os.remove(dest)   # the next route can be a different
-            except Exception:     # host/encode — never continue
-                pass              # somebody else's bytes
+            for gone in (dest, dest + SEG_SUFFIX,
+                         dest + STATE_SUFFIX):
+                try:
+                    os.remove(gone)   # the next route can be a
+                except Exception:     # different host/encode — never
+                    pass              # continue somebody else's bytes
     raise RuntimeError(
         f"every CDN route failed ({len(errors)} tried, most got to "
         f"{human_size(best) or '0 B'}): " + " | ".join(errors)[:240])
 
 
-async def _download_route(url: str, dest: str, job=None) -> str:
-    """ONE candidate url: keep resuming from the bytes on disk until
-    the file is complete, or until the server proves the transfer
-    cannot be continued."""
+SEG_PARTS = 4               # parallel Range connections per file
+SEG_MIN_FILE = 12 << 20     # below this, one connection is plenty
+MIN_SPEED = 64 * 1024       # B/s — under this the CDN is hopeless
+SPEED_GRACE = 60            # seconds measured before judging it
+MAX_ETA = 45 * 60           # projected finish beyond this = skip it
+SEG_SUFFIX = ".seg"         # preallocated in-progress file
+STATE_SUFFIX = ".dlpart"    # its resume sidecar (json)
+
+
+class _SpeedWatch:
+    """Honest aggregate throughput PLUS a verdict.
+
+    A CDN that dribbles 1 KB/s is worse than one that refuses: it
+    held a lane for hours (the '🚀 1.1 KB/s · ⏳ ETA 211965s' panel)
+    while 34 other videos waited behind it. After SPEED_GRACE
+    seconds, a route under MIN_SPEED — or one whose projected finish
+    sits past MAX_ETA — is abandoned, the file is skipped, and the
+    batch retries it at the end instead of grinding."""
+
+    def __init__(self, total, done=0):
+        self.total = int(total or 0)
+        self.t0 = time.time()
+        self.d0 = int(done or 0)
+        self.rate = 0.0
+        self._last = 0.0
+
+    def update(self, done):
+        now = time.time()
+        if now - self._last >= 1.0:
+            self._last = now
+            self.rate = max(0, int(done) - self.d0) \
+                / max(0.001, now - self.t0)
+        return self.rate
+
+    def verdict(self, done):
+        """None while the route is healthy, a reason when hopeless."""
+        el = time.time() - self.t0
+        if el < SPEED_GRACE:
+            return None
+        rate = self.rate or (max(0, int(done) - self.d0)
+                             / max(0.001, el))
+        if rate < 1024:
+            return f"CDN sent nothing for {int(el)}s"
+        if rate < MIN_SPEED:
+            return (f"CDN crawling at {int(rate // 1024)} KB/s "
+                    f"(floor {MIN_SPEED // 1024} KB/s)")
+        if self.total:
+            eta = (self.total - int(done)) / rate
+            if eta > MAX_ETA:
+                return (f"CDN too slow — {int(rate // 1024)} KB/s, "
+                        f"ETA {int(eta // 60)} min (cap "
+                        f"{MAX_ETA // 60} min)")
+        return None
+
+
+def _seg_paths(dest):
+    return dest + SEG_SUFFIX, dest + STATE_SUFFIX
+
+
+def _partition(total, nparts):
+    """[start, end, pos] triples covering exactly [0, total)."""
+    step = max(1 << 20, (int(total) + nparts - 1) // nparts)
+    out = []
+    start = 0
+    while start < total:
+        end = min(int(total), start + step)
+        out.append([start, end, start])
+        start = end
+    return out
+
+
+def _load_state(path, url, total, parts):
+    """The resume sidecar. Only one for the SAME url and size is
+    trusted. Recording a pos BEHIND the bytes actually written is
+    safe: re-fetching a range writes identical bytes back at the
+    identical offset, so a crash between a write and a save costs a
+    little re-download, never corruption."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:
+        return None
+    if st.get("url") != url or int(st.get("total") or -1) != int(total):
+        return None
+    saved = st.get("parts") or []
+    if len(saved) != len(parts):
+        return None
+    for i, (part, sp) in enumerate(zip(parts, saved)):
+        try:
+            pos = int(sp[1])
+            if int(sp[0]) != part[0]:
+                return None
+        except Exception:
+            return None
+        parts[i][2] = max(part[0], min(part[1], pos))
+    return parts
+
+
+def _save_state(path, url, total, parts):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"url": url, "total": int(total),
+                       "parts": [[p[0], p[2]] for p in parts]}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+async def _probe(url):
+    """One 1-byte Range request: does this route HONOUR Range, and
+    how big is the file? Returns (total, ranges_ok, referer, error).
+    The Cloudflare-Worker proxy answers 200 (Range is on its
+    forbidden-header list) — that route can only be walked
+    sequentially; the seedbox behind it answers 206 and can be
+    downloaded SEG_PARTS connections at a time."""
     s, _ = http_session(900)
-    # total=None: a big 720p/1080p file on a slow line can take far
-    # longer than any fixed TOTAL timeout — the old 900 s cap killed
-    # large transfers mid-file. Bound the STALL instead: 180 s
-    # without a single byte is a dead transfer, but slow-yet-moving
-    # may run as long as it needs.
+    timeout = aiohttp.ClientTimeout(total=90, sock_connect=30,
+                                    sock_read=60)
+    err = "probe failed"
+    for referer in (False, True):
+        headers = {"User-Agent": BROWSER_UA, "Accept": "*/*",
+                   "Accept-Language": "en-US,en;q=0.9",
+                   "Range": "bytes=0-0"}
+        if referer:
+            headers["Referer"] = _referer_for(url)
+        try:
+            async with s.get(url, headers=headers,
+                             timeout=timeout) as r:
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if ctype.startswith(ERROR_CTYPES):
+                    return 0, False, referer, (
+                        f"CDN served an error page ({ctype}, HTTP "
+                        f"{r.status}), not a video — the link is dead")
+                rng = r.headers.get("Content-Range") or ""
+                tail = rng.split("/")[-1] if "/" in rng else ""
+                if r.status == 206:
+                    return (int(tail) if tail.isdigit() else 0), \
+                        True, referer, None
+                if r.status == 200:
+                    return int(r.headers.get("Content-Length") or 0), \
+                        False, referer, None
+                if r.status == 416:
+                    return (int(tail) if tail.isdigit() else 0), \
+                        False, referer, None
+                if r.status in (401, 403, 451) and not referer:
+                    err = f"HTTP {r.status}"
+                    continue
+                return 0, False, referer, f"HTTP {r.status}"
+        except Exception as exc:
+            err = repr(exc)[:110]
+    return 0, False, False, err
+
+
+async def _download_route(url: str, dest: str, job=None) -> str:
+    """ONE candidate url: probe it, then take the fastest path it
+    supports — SEG_PARTS parallel Range requests for a big file on a
+    Range-honouring host, otherwise a sequential walk that resumes
+    after every cut. Both are validated, and both abandon a route
+    that crawls instead of holding the lane for hours."""
+    total, ranges, referer, why = await _probe(url)
+    if why:
+        raise _CdnError(why)
+    have = os.path.getsize(dest) if os.path.exists(dest) else 0
+    if total and have >= total and have >= MIN_VIDEO_BYTES:
+        if job is not None:
+            job["done"] = job["total"] = have
+        return dest                     # already on disk, complete
+    if ranges and total >= SEG_MIN_FILE:
+        return await _download_parallel(url, dest, job, total,
+                                        referer)
+    return await _download_sequential(url, dest, job, referer)
+
+
+async def _download_parallel(url: str, dest: str, job, total,
+                             referer=False) -> str:
+    """SEG_PARTS concurrent Range requests into ONE preallocated file.
+
+    This is how leech bots pull 6+ MB/s off a CDN that gives a single
+    connection a trickle: four streams in flight instead of one, and
+    a cut costs ONE part a few MB (it resumes itself) instead of
+    failing the file. The in-progress file is ``<dest>.seg`` with a
+    JSON sidecar of part offsets; only when EVERY part is complete
+    and the size matches is it renamed onto ``dest`` — a half-built
+    file can never be mistaken for a finished one, and a restart
+    picks the parts up exactly where they stopped."""
+    seg, state = _seg_paths(dest)
+    parts = _partition(total, SEG_PARTS)
+    have = os.path.getsize(dest) if os.path.exists(dest) else 0
+    if _load_state(state, url, total, parts) is None:
+        try:
+            if have:
+                # a dense prefix on `dest` (sequential path, or a run
+                # from before this feature) is REAL data — move it
+                # over and credit every byte it covers
+                os.replace(dest, seg)
+                have = os.path.getsize(seg)
+            elif os.path.exists(seg):
+                os.remove(seg)
+        except Exception:
+            have = 0
+        fd0 = os.open(seg, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.truncate(fd0, total)
+        finally:
+            os.close(fd0)
+        for p in parts:
+            p[2] = max(p[0], min(p[1], have))
+    present = lambda: sum(p[2] - p[0] for p in parts)   # noqa: E731
+    if job is not None:
+        job["total"] = total
+        job["done"] = present()
+    watch = _SpeedWatch(total, present())
+    stop = {"err": None}
+    loop = asyncio.get_running_loop()
+    fd = os.open(seg, os.O_RDWR)
+    try:
+        async def _part(i):
+            nonlocal referer
+            s, _ = http_session(900)
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=30,
+                                            sock_read=180)
+            stalls = 0
+            resumes = 0
+            saved = time.time()
+            while True:
+                if stop["err"] is not None:
+                    return
+                if job is not None and job["cancel"]:
+                    raise JobCancelled()
+                start, end, pos = parts[i]
+                if pos >= end:
+                    return
+                headers = {"User-Agent": BROWSER_UA, "Accept": "*/*",
+                           "Accept-Language": "en-US,en;q=0.9",
+                           "Range": f"bytes={pos}-{end - 1}"}
+                if referer:
+                    headers["Referer"] = _referer_for(url)
+                got, cut = 0, None
+                try:
+                    async with s.get(url, headers=headers,
+                                     timeout=timeout) as r:
+                        if r.status in (401, 403, 451) and not referer:
+                            referer = True
+                            continue
+                        if r.status != 206:
+                            raise _CdnError(
+                                f"part {i + 1}/{len(parts)}: HTTP "
+                                f"{r.status} for Range bytes={pos}-"
+                                f"{end - 1}")
+                        ctype = (r.headers.get("Content-Type")
+                                 or "").lower()
+                        if ctype.startswith(ERROR_CTYPES):
+                            raise _CdnError(
+                                f"CDN served an error page ({ctype}) "
+                                f"mid-file — the link died")
+                        async for chunk in \
+                                r.content.iter_chunked(1 << 20):
+                            if stop["err"] is not None:
+                                return
+                            if job is not None and job["cancel"]:
+                                raise JobCancelled()
+                            if len(chunk) > end - pos:
+                                chunk = chunk[:end - pos]
+                            if not chunk:
+                                break
+                            await loop.run_in_executor(
+                                None, os.pwrite, fd, chunk, pos)
+                            pos += len(chunk)
+                            got += len(chunk)
+                            parts[i][2] = pos
+                            d = present()
+                            rate = watch.update(d)
+                            if job is not None:
+                                job["done"] = d
+                                job["speed"] = rate
+                            bad = watch.verdict(d)
+                            if bad:
+                                stop["err"] = bad
+                                raise _CdnError(bad)
+                            now = time.time()
+                            if now - saved >= 3.0:
+                                saved = now
+                                _save_state(state, url, total, parts)
+                except (JobCancelled, _CdnError):
+                    raise
+                except Exception as exc:
+                    cut = exc      # cut/reset/stall: the part resumes
+                if parts[i][2] >= end:
+                    return
+                if got:
+                    stalls = 0
+                    resumes += 1
+                    if resumes > MAX_RESUME:
+                        raise _CdnError(
+                            f"part {i + 1}: CDN cut it {resumes} "
+                            f"times, still {parts[i][2]}/{end} B")
+                    await asyncio.sleep(0.15)
+                    continue
+                stalls += 1
+                if stalls >= STALL_LIMIT:
+                    raise _CdnError(
+                        f"part {i + 1}: no progress at {parts[i][2]}/"
+                        f"{end} B ({repr(cut)[:70] if cut else 'EOF'})")
+                await asyncio.sleep(0.8 * stalls)
+
+        tasks = [asyncio.ensure_future(_part(i))
+                 for i in range(len(parts))]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            stop["err"] = stop["err"] or "aborted"
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        _save_state(state, url, total, parts)
+        got = present()
+        if got < total or os.path.getsize(seg) != total:
+            raise _CdnError(f"parallel download incomplete: {got}/"
+                            f"{total} B")
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    if total < MIN_VIDEO_BYTES:
+        raise _CdnError(f"file is only {total} B — no episode is that "
+                        "small; dead CDN link")
+    try:
+        os.remove(state)
+    except Exception:
+        pass
+    os.replace(seg, dest)          # only a COMPLETE file lands here
+    if job is not None:
+        job["done"] = job["total"] = total
+    print(f"[autodl] {len(parts)}-part parallel download done: "
+          f"{total} B from {_host_of(url)}")
+    return dest
+
+
+async def _download_sequential(url: str, dest: str, job=None,
+                               referer=False) -> str:
+    """A route that ignores Range (the Cloudflare proxy) or a small
+    file: one connection, resumed after every cut until complete."""
+    s, _ = http_session(900)
+    # total=None: a big file on a slow line can take far longer than
+    # any fixed TOTAL timeout — the old 900 s cap killed large
+    # transfers mid-file. Bound the STALL instead: 180 s without a
+    # single byte is dead, slow-but-moving may run as long as it
+    # needs — and _SpeedWatch decides when "slow" becomes hopeless.
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30,
                                     sock_read=180)
     loop = asyncio.get_running_loop()
-    referer = False
     resumes = 0
     stalls = 0
+    watch = None
     while True:
         have = os.path.getsize(dest) if os.path.exists(dest) else 0
         headers = {"User-Agent": BROWSER_UA, "Accept": "*/*",
@@ -852,8 +1215,8 @@ async def _download_route(url: str, dest: str, job=None) -> str:
                         f"{status}), not a video — the link is dead")
                 if job is not None and total:
                     job["total"] = total
-                last = time.time()
-                last_done = done
+                if watch is None and total:
+                    watch = _SpeedWatch(total, done)
                 with open(dest, mode) as f:
                     async for chunk in r.content.iter_chunked(1 << 20):
                         if job is not None and job["cancel"]:
@@ -872,11 +1235,13 @@ async def _download_route(url: str, dest: str, job=None) -> str:
                         done += len(chunk)
                         if job is not None:
                             job["done"] = done
-                            now = time.time()
-                            if now - last >= 1.0:
-                                job["speed"] = ((done - last_done)
-                                                / (now - last))
-                                last, last_done = now, done
+                        if watch is not None:
+                            rate = watch.update(done)
+                            if job is not None:
+                                job["speed"] = rate
+                            bad = watch.verdict(done)
+                            if bad:
+                                raise _CdnError(bad)
         except (JobCancelled, _CdnError):
             raise
         except Exception as exc:
@@ -1089,22 +1454,30 @@ async def posting_channels():
     return out
 
 
-def wanted_streams(streams, qualities, want_base: bool, want_eng: bool):
+def wanted_streams(streams, qualities, want_base: bool, want_eng: bool,
+                   eng_qualities=None):
     """Streams matching the configured qualities AND the tags of
-    the channels we post to (indo -> base, eng -> '-eng' only)."""
-    want = {q.lower() for q in qualities}
-    all_q = not want or "all" in want
+    the channels we post to (indo -> base, eng -> '-eng' only).
+    /qualityindo and /qualityeng keep SEPARATE lists, so eng flavours
+    are filtered by eng_qualities when the caller has one (None keeps
+    the old single-list behaviour)."""
     out = []
     for s in streams or []:
         label = (s.get("quality") or "").lower()
-        base = label.split("-")[0]
-        if base.isdigit():
-            base += "p"  # "360-eng" means "360p-eng"
-        if not all_q and base not in want:
-            continue
+        base = base_quality(label)
         eng = _has_eng(label)
-        if (eng and want_eng) or (not eng and want_base):
-            out.append(s)
+        if eng:
+            if not want_eng:
+                continue
+            if not _sel_ok(base, eng_qualities if eng_qualities
+                           is not None else qualities):
+                continue
+        else:
+            if not want_base:
+                continue
+            if not _sel_ok(base, qualities):
+                continue
+        out.append(s)
     return out
 
 
@@ -1113,25 +1486,97 @@ def wanted_streams(streams, qualities, want_base: bool, want_eng: bool):
 # ---------------------------------------------------------------------- #
 async def check_new():
     """(item, streams_to_download, all_streams) for every episode
-    that still has a quality missing from the registry."""
+    that still has a quality missing from the registry.
+
+    TWO guards keep a batch honest:
+      • DEDUPE — the API can list the same episode twice (two ids,
+        'Eps 4' and 'Eps 04', or both sections), which used to queue
+        the very same file twice: it failed as 'Video 1/35' and then
+        again as 'Video 2/35' — the loop the owner saw. One (series,
+        ep, quality) = one job per pass.
+      • NO RETRO-FILL — ticking a quality later (/qualityindo,
+        /qualityeng) applies to NEW episodes only. An episode that is
+        already known keeps the selection that was in force when it
+        was first seen, so old episodes are never dragged back into
+        the queue for a quality nobody asked for then. /searchad and
+        /syncbutton still top anything up on demand (force paths)."""
     st = await get_settings()
     items = await fetch_latest(st["sections"])
     fresh = []
+    seen_keys = set()
     for item in items:
         series, ep = parse_api_title(item.get("title", ""))
         norm = normalize_key(series)
         # always archive every flavour the API offers; channel tags
         # only decide WHERE each flavour gets posted
         streams = wanted_streams(item.get("streams", []),
-                                 st["qualities"], True, True)
+                                 st["qualities"], True, True,
+                                 st["qualities_eng"])
         if not streams:
             continue
-        todo = [s for s in streams
-                if not already_downloaded(
-                    norm, ep, s.get("quality", ""))]
+        allowed = await _ep_allowed(norm, ep, st)
+        todo = []
+        for s in streams:
+            q = s.get("quality", "")
+            if already_downloaded(norm, ep, q):
+                continue
+            if not allowed(q):
+                continue      # quality was not selected for THIS ep
+            k = (norm, str(ep), base_quality(q), _has_eng(q))
+            if k in seen_keys:
+                continue      # same file already queued this pass
+            seen_keys.add(k)
+            todo.append(s)
         if todo:
             fresh.append((item, todo, streams))
     return fresh
+
+
+def registered_quals(norm, ep) -> set:
+    """Every quality of this episode the registry already holds."""
+    pre = f"{norm}:{ep}:"
+    return {k[len(pre):] for k in _registered if k.startswith(pre)}
+
+
+async def _ep_allowed(norm, ep, st):
+    """Remember the selection in force the FIRST time an episode is
+    seen; from then on only those qualities may be fetched for it
+    (intersected with the live selection, so unticking still stops
+    everything). Episodes taken before this feature existed adopt the
+    qualities they ALREADY have — that is what clears the backlog of
+    old episodes missing 720p instead of re-queueing all of them."""
+    doc = None
+    try:
+        doc = await store.col("ep_seen").find_one(
+            {"_id": f"{norm}:{ep}"})
+    except Exception:
+        doc = None
+    if doc is None:
+        known = registered_quals(norm, ep)
+        if known:
+            q = sorted({base_quality(x) for x in known
+                        if not _has_eng(x)})
+            qe = sorted({base_quality(x) for x in known if _has_eng(x)})
+        else:
+            q, qe = list(st["qualities"]), list(st["qualities_eng"])
+        try:
+            await store.col("ep_seen").update_one(
+                {"_id": f"{norm}:{ep}"},
+                {"$set": {"q": q, "qe": qe, "norm": norm, "ep": ep,
+                          "ts": time.time()}}, upsert=True)
+        except Exception:
+            pass
+    else:
+        q = doc.get("q") or []
+        qe = doc.get("qe") or []
+
+    def allowed(label):
+        base = base_quality(label)
+        if _has_eng(label):
+            return _sel_ok(base, st["qualities_eng"]) \
+                and _sel_ok(base, qe)
+        return _sel_ok(base, st["qualities"]) and _sel_ok(base, q)
+    return allowed
 
 
 # ---------------------------------------------------------------------- #
@@ -1170,7 +1615,8 @@ def _free_up(need_mb=900):
         files = sorted(
             (os.path.join(DOWNLOAD_DIR, f)
              for f in os.listdir(DOWNLOAD_DIR)
-             if f.endswith((".mp4", ".mkv", ".part"))),
+             if f.endswith((".mp4", ".mkv", ".part",
+                            ".seg", ".dlpart"))),
             key=os.path.getmtime)
         for path in files:
             if free >= need_mb:
@@ -1617,7 +2063,7 @@ async def run_batch(fresh, force=False, executor="auto", locks=()):
     # concurrent batch ever owns the panel
     st = {"n": 0, "total": total, "skip": 0, "stop": False,
           "ok": 0, "bad": 0, "can": 0, "locks": tuple(locks),
-          "panel": not BATCHES}
+          "panel": not BATCHES, "defer": [], "seen": set()}
     done = 0
     BATCHES[id(st)] = st
     try:
@@ -1670,6 +2116,26 @@ async def run_batch(fresh, force=False, executor="auto", locks=()):
                 if await process_group(g, force=force,
                                        executor=executor, st=st):
                     done += 1
+        # ⏭ RETRY PASS — every file skipped during the batch (CDN
+        # crawling, cut, timeout) gets one more go now that the queue
+        # is empty, so nothing is silently dropped and nothing holds
+        # the batch up while it is still working
+        defer = list(st.get("defer") or [])
+        st["defer"] = []
+        if defer:
+            st["retried"] = len(defer)
+            print(f"[autodl] retry pass: {len(defer)} skipped file(s)")
+            for (g, it, epn, s_, dbi, po, ex, _why) in defer:
+                if st.get("stop"):
+                    break
+                try:
+                    if not force and await registry_get(
+                            g["norm"], epn, s_["quality"]):
+                        continue    # another lane already archived it
+                except Exception:
+                    pass
+                await _run_stream(g, it, epn, s_, dbi, po, ex, st,
+                                  retry=True)
     finally:
         BATCHES.pop(id(st), None)
         last = not BATCHES   # the last batch standing does cleanup
@@ -1683,6 +2149,9 @@ async def run_batch(fresh, force=False, executor="auto", locks=()):
                     f"⬇️ archived: <b>{ok}</b> · ❌ failed: <b>{bad}</b>"
                     f" · 🛑 cancelled: <b>{can}</b>\n"
                     f"📺 posted: <b>{done}</b> episode card(s)\n"
+                    + (f"⏭ skipped mid-batch, retried at the end: "
+                       f"<b>{st.get('retried', 0)}</b>\n"
+                       if st.get("retried") else "")
                     + (f"⚠️ skipped: <b>{st.get('skip', 0)}</b> "
                        f"group(s) — no DB channel / storage offline\n"
                        if st.get("skip") else "")
@@ -2257,36 +2726,38 @@ async def _parallel_on() -> bool:
 
 
 async def _run_stream(group, item, ep, stream, db_ids, poster,
-                      executor="auto", st=None):
-    """One file of a group: run_job with one retry, honest failure
-    reporting and lane cleanup. Returns True when it archived."""
+                      executor="auto", st=None, retry=False):
+    """One file of a group: ONE run_job attempt, honest failure
+    reporting and lane cleanup. Returns True when it archived.
+
+    A failure is no longer hammered on the spot — that used to burn
+    2 × 90 minutes per hopeless file, and the panel showed the SAME
+    episode as 'Video 1/35' and then 'Video 2/35' (the loop the owner
+    saw). Now the file is DEFERRED: the batch moves to the next video
+    immediately and run_batch gives every deferred file one more try
+    once the queue is empty."""
     global CURRENT, CURRENT2
     series = group["series"]
     # one stalled file must never kill the whole batch or
     # hold a lane lock forever
     err = None
     job = None
-    for attempt in (1, 2):  # one retry before giving up
-        err = None
-        job = None
-        try:
-            job = await asyncio.wait_for(
-                run_job(group, item, ep, stream, db_ids, poster,
-                        executor=executor, st=st),
-                timeout=5400)
-        except asyncio.TimeoutError:
-            err = "timeout (90 min)"
-        except Exception as exc:
-            err = repr(exc)[:160]
-        # a job can also fail QUIETLY (disk low / archive
-        # error inside run_job) — never let that stay silent
-        if err is None and job is not None \
-                and job.get("status") == "failed":
-            err = job.get("error") or "failed"
-        if err is None:
-            break
-        print(f"[autodl] job attempt {attempt} failed "
-              f"({err}): {series} Ep {ep} "
+    try:
+        job = await asyncio.wait_for(
+            run_job(group, item, ep, stream, db_ids, poster,
+                    executor=executor, st=st),
+            timeout=3600)
+    except asyncio.TimeoutError:
+        err = "timeout (60 min)"
+    except Exception as exc:
+        err = repr(exc)[:160]
+    # a job can also fail QUIETLY (disk low / archive error inside
+    # run_job) — never let that stay silent
+    if err is None and job is not None \
+            and job.get("status") == "failed":
+        err = job.get("error") or "failed"
+    if err is not None:
+        print(f"[autodl] job failed ({err}): {series} Ep {ep} "
               f"{stream['quality']}")
         tgt = job if job is not None else (CURRENT or CURRENT2)
         if tgt is not None and tgt.get("status") == "running":
@@ -2300,9 +2771,18 @@ async def _run_stream(group, item, ep, stream, db_ids, poster,
             JOBS.pop(tgt.get("id"), None)  # a dead attempt leaves the
             # registry at once — /cancel_<id> only finds live jobs
         _free_up(900)
-        if err == "disk low" or err.startswith("archive"):
-            break  # re-downloading cannot fix disk/channel
-        await asyncio.sleep(3)
+    deferred = False
+    if err is not None and not retry and st is not None \
+            and err != "disk low" and not err.startswith("archive") \
+            and not st.get("stop"):
+        # ⏭ skip it NOW, retry when the queue is empty: a crawling
+        # or cutting CDN must never hold the batch hostage
+        st.setdefault("defer", []).append(
+            (group, item, ep, stream, db_ids, poster, executor,
+             err[:110]))
+        deferred = True
+        print(f"[autodl] deferring {series} Ep {ep} "
+              f"[{stream['quality']}] to the end-of-batch retry")
     if job is not None:
         # per-batch tallies for the summary (the JOBS registry is
         # shared between concurrent batches — never clear it whole)
@@ -2310,12 +2790,12 @@ async def _run_stream(group, item, ep, stream, db_ids, poster,
             _s = job.get("status")
             if _s == "done":
                 st["ok"] += 1
-            elif _s == "failed":
-                st["bad"] += 1
+            elif _s == "failed" and not deferred:
+                st["bad"] += 1     # a deferred file is not lost yet
             elif _s == "cancelled":
                 st["can"] += 1
         JOBS.pop(job.get("id"), None)
-    if err:  # never silent: tell the owner
+    if err and not deferred:  # never silent: tell the owner
         print("[autodl] job FAILED:", series, "Ep", ep,
               stream["quality"], err)
         asyncio.ensure_future(_owner_dm(
@@ -2357,14 +2837,24 @@ async def process_group(group, force=False, executor="auto",
             break
         _, ep = parse_api_title(item.get("title", ""))
         pend = []
+        seen = st.setdefault("seen", set())
         for stream in todo:
-            if not force and await registry_get(
-                    norm, ep, stream["quality"]):
+            q = stream["quality"]
+            if not force and await registry_get(norm, ep, q):
                 continue  # another batch already archived this file
+            k = (norm, str(ep), base_quality(q), _has_eng(q))
+            if k in seen:
+                # the API can list one episode twice — never run the
+                # same file twice inside one batch
+                print(f"[autodl] duplicate {series} Ep {ep} [{q}] "
+                      "skipped (already queued in this batch)")
+                continue
             pend.append(stream)
         for stream in pend:
             if st.get("stop"):
                 break
+            q = stream["quality"]
+            seen.add((norm, str(ep), base_quality(q), _has_eng(q)))
             await _run_stream(group, item, ep, stream, db_ids,
                               poster, executor, st)
 

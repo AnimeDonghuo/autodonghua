@@ -58,6 +58,13 @@ DL = os.path.join(HERE, "dl")
 CFG = {}
 MIN_VIDEO_BYTES = 1024 * 1024   # anything smaller is a CDN error
                                 # page, never an episode video
+SEG_PARTS = 4               # parallel Range connections per file
+SEG_MIN_FILE = 12 << 20     # below this, one connection is plenty
+MIN_SPEED = 64 * 1024       # B/s — under this the CDN is hopeless
+SPEED_GRACE = 60            # seconds measured before judging it
+MAX_ETA = 45 * 60           # projected finish beyond this = skip it
+SEG_SUFFIX = ".seg"         # preallocated in-progress file
+STATE_SUFFIX = ".dlpart"    # its resume sidecar (json)
 _PROG = {"last": 0.0}
 _COUNT = {"bytes": 0, "t0": time.time()}
 _ACTIVE = {"job": None, "phase": "", "total": 0}   # the beat
@@ -174,17 +181,56 @@ def _referer_for(url):
     return API_ROOT + "/"
 
 
-def _dl_request(url, referer=False, have=0):
+def _dl_request(url, referer=False, have=0, end=0):
     """Browser headers — episode CDNs answer the bare
     Python-urllib User-Agent with 403 Forbidden — plus the Range
-    header that turns a cut transfer into a continuable one."""
+    header that turns a cut transfer into a continuable one.
+    ``end`` bounds the range (one parallel part's slice)."""
     h = {"User-Agent": BROWSER_UA, "Accept": "*/*",
          "Accept-Language": "en-US,en;q=0.9"}
     if referer:
         h["Referer"] = _referer_for(url)
-    if have:
+    if end:
+        # a bounded slice — one parallel part. `have` may legitimately
+        # be 0 (the first part), so `end` is what decides the form
+        h["Range"] = "bytes=%d-%d" % (have, end - 1)
+    elif have:
         h["Range"] = "bytes=%d-" % have
     return urllib.request.Request(url, headers=h)
+
+
+def sweep(max_age_min=10):
+    """Disk hygiene — the VPS must outlive months of unattended
+    runs. Sweeps only ever run BETWEEN jobs (boot, and the gap before
+    the next claim), so NOTHING in dl/ is being written: every file
+    older than max_age_min is an orphan from a killed/crashed run and
+    goes — including the parallel downloader's <name>.seg /
+    <name>.dlpart work files. Boot calls sweep(2) (a 2-minute floor
+    so even an accidental double-start cannot wipe a file another
+    worker is actively writing). worker.log is capped too (the shell
+    redirect appends, so truncating is safe — the fd keeps writing at
+    the new EOF)."""
+    now = time.time()
+    try:
+        for f in os.listdir(DL):
+            p = os.path.join(DL, f)
+            try:
+                if os.path.isfile(p) and \
+                        now - os.path.getmtime(p) >= max_age_min * 60:
+                    os.remove(p)
+                    log("sweep: removed orphan", f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        lp = os.path.join(HERE, "worker.log")
+        if os.path.getsize(lp) > 4 * 1048576:
+            with open(lp, "r+") as fh:
+                fh.truncate(0)
+            log("sweep: worker.log truncated (>4 MB)")
+    except Exception:
+        pass
 
 
 def download(url, path, job_id):
@@ -208,22 +254,387 @@ def download(url, path, job_id):
             errs.append("%s: %s" % (_host_of(cand), repr(exc)[:120]))
             log("download route failed:", cand[:70], "-",
                 repr(exc)[:140])
-            try:
-                os.remove(path)   # the next route can be a different
-            except Exception:     # host/encode — never append to
-                pass              # somebody else's bytes
+            for gone in (path, path + SEG_SUFFIX,
+                         path + STATE_SUFFIX):
+                try:
+                    os.remove(gone)   # the next route can be a
+                except Exception:     # different host/encode — never
+                    pass              # continue somebody else's bytes
     raise RuntimeError("every CDN route failed (best %d MB on disk): %s"
                        % (best // 1048576, " | ".join(errs)[:220]))
 
 
+def _seg_paths(path):
+    return path + SEG_SUFFIX, path + STATE_SUFFIX
+
+
+def _partition(total, nparts):
+    """[start, end, pos] triples covering exactly [0, total)."""
+    step = max(1 << 20, (int(total) + nparts - 1) // nparts)
+    out = []
+    start = 0
+    while start < total:
+        end = min(int(total), start + step)
+        out.append([start, end, start])
+        start = end
+    return out
+
+
+def _load_state(state_path, url, total, parts):
+    """Resume sidecar — trusted only for the SAME url and size. A pos
+    recorded BEHIND the bytes actually written is safe: re-fetching a
+    range writes identical bytes back at the identical offset."""
+    try:
+        with open(state_path, "r") as fh:
+            st = json.load(fh)
+    except Exception:
+        return None
+    if st.get("url") != url or int(st.get("total") or -1) != int(total):
+        return None
+    saved = st.get("parts") or []
+    if len(saved) != len(parts):
+        return None
+    for i in range(len(parts)):
+        try:
+            if int(saved[i][0]) != parts[i][0]:
+                return None
+            pos = int(saved[i][1])
+        except Exception:
+            return None
+        parts[i][2] = max(parts[i][0], min(parts[i][1], pos))
+    return parts
+
+
+def _save_state(state_path, url, total, parts):
+    tmp = state_path + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"url": url, "total": int(total),
+                       "parts": [[p[0], p[2]] for p in parts]}, fh)
+        os.replace(tmp, state_path)
+    except Exception:
+        pass
+
+
+class SpeedWatch(object):
+    """Aggregate throughput + a verdict.
+
+    A CDN that dribbles 1 KB/s is worse than one that refuses: it
+    held the worker (and the Koyeb lane waiting on it) for hours
+    while the rest of the batch queued up. After SPEED_GRACE seconds
+    a route under MIN_SPEED — or one whose projected finish is past
+    MAX_ETA — is abandoned so the job fails fast, visibly, and the
+    batch moves on to the next video."""
+
+    def __init__(self, total, done=0):
+        self.total = int(total or 0)
+        self.t0 = time.time()
+        self.d0 = int(done or 0)
+        self.rate = 0.0
+        self._last = 0.0
+
+    def update(self, done):
+        now = time.time()
+        if now - self._last >= 1.0:
+            self._last = now
+            self.rate = max(0, int(done) - self.d0) \
+                / max(0.001, now - self.t0)
+        return self.rate
+
+    def verdict(self, done):
+        el = time.time() - self.t0
+        if el < SPEED_GRACE:
+            return None
+        rate = self.rate or (max(0, int(done) - self.d0)
+                             / max(0.001, el))
+        if rate < 1024:
+            return "CDN sent nothing for %ds" % int(el)
+        if rate < MIN_SPEED:
+            return ("CDN crawling at %d KB/s (floor %d KB/s)"
+                    % (rate // 1024, MIN_SPEED // 1024))
+        if self.total:
+            eta = (self.total - int(done)) / rate
+            if eta > MAX_ETA:
+                return ("CDN too slow — %d KB/s, ETA %d min (cap %d "
+                        "min)" % (rate // 1024, eta // 60,
+                                  MAX_ETA // 60))
+        return None
+
+
+def _probe(url):
+    """One 1-byte Range request: does this route HONOUR Range and how
+    big is the file? (total, ranges_ok, referer, error). The
+    Cloudflare-Worker proxy answers 200 — Range is on its forbidden
+    header list — so that route can only be walked sequentially; the
+    seedbox behind it answers 206 and can be pulled SEG_PARTS
+    connections at a time."""
+    err = "probe failed"
+    for referer in (False, True):
+        try:
+            req = _dl_request(url, referer, 0)
+            req.add_header("Range", "bytes=0-0")
+            r = urllib.request.urlopen(req, timeout=90)
+        except urllib.error.HTTPError as ex:
+            if ex.code in (401, 403, 451) and not referer:
+                err = "HTTP %s" % ex.code
+                continue
+            ctype = ""
+            rng = ""
+            try:
+                ctype = (ex.headers.get("Content-Type") or "").lower()
+                rng = ex.headers.get("Content-Range") or ""
+            except Exception:
+                pass
+            if ctype.startswith(ERROR_CTYPES):
+                return 0, False, referer, (
+                    "CDN served an error page (%s), not a video "
+                    "— the link is dead" % ctype)
+            tail = rng.split("/")[-1] if "/" in rng else ""
+            if ex.code == 416:
+                return (int(tail) if tail.isdigit() else 0), \
+                    False, referer, None
+            return 0, False, referer, "HTTP %s" % ex.code
+        except Exception as ex:
+            err = repr(ex)[:110]
+            continue
+        try:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            rng = r.headers.get("Content-Range") or ""
+            code = getattr(r, "status", 0) or r.getcode()
+            tail = rng.split("/")[-1] if "/" in rng else ""
+            if ctype.startswith(ERROR_CTYPES):
+                return 0, False, referer, (
+                    "CDN served an error page (%s), not a video "
+                    "— the link is dead" % ctype)
+            if code == 206:
+                return (int(tail) if tail.isdigit() else 0), \
+                    True, referer, None
+            if code == 200:
+                return int(r.headers.get("Content-Length") or 0), \
+                    False, referer, None
+            if code == 416:
+                return (int(tail) if tail.isdigit() else 0), \
+                    False, referer, None
+            return 0, False, referer, "HTTP %s" % code
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+    return 0, False, False, err
+
+
 def _download_route(url, path, job_id):
-    """ONE candidate url: resume from the bytes on disk until the file
-    is complete, or until the server proves it cannot be continued.
-    Returns the byte count."""
+    """ONE candidate url: probe it, then take the fastest path it
+    supports — SEG_PARTS parallel Range requests for a big file on a
+    Range-honouring host, otherwise a sequential walk that resumes
+    after every cut. Both validate, both abandon a crawling route."""
+    total, ranges, referer, why = _probe(url)
+    if why:
+        raise CdnError(why)
+    have = os.path.getsize(path) if os.path.exists(path) else 0
+    if total and have >= total and have >= MIN_VIDEO_BYTES:
+        _COUNT["bytes"] = have
+        progress(job_id, "download", have, have)
+        return have                 # already on disk, complete
+    if ranges and total >= SEG_MIN_FILE:
+        return _download_parallel(url, path, job_id, total, referer)
+    return _download_sequential(url, path, job_id, referer)
+
+
+def _download_parallel(url, path, job_id, total, referer=False):
+    """SEG_PARTS concurrent Range requests into ONE preallocated file.
+
+    This is how leech bots pull several MB/s off a CDN that gives a
+    single connection a trickle (or cuts it after a few MB): four
+    streams in flight, each resuming ITSELF, so a cut costs one part
+    a few megabytes instead of failing the job. The in-progress file
+    is ``<path>.seg`` with a JSON sidecar of part offsets; only when
+    EVERY part is complete and the size matches is it renamed onto
+    ``path`` — a half-built file can never be uploaded as a video."""
+    from concurrent.futures import ThreadPoolExecutor
+    seg, state = _seg_paths(path)
+    parts = _partition(total, SEG_PARTS)
+    have = os.path.getsize(path) if os.path.exists(path) else 0
+    lock = threading.Lock()
+    if _load_state(state, url, total, parts) is None:
+        try:
+            if have:
+                os.replace(path, seg)   # a dense prefix is REAL data
+                have = os.path.getsize(seg)
+            elif os.path.exists(seg):
+                os.remove(seg)
+        except Exception:
+            have = 0
+        fd0 = os.open(seg, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            os.truncate(fd0, total)
+        finally:
+            os.close(fd0)
+        for p in parts:
+            p[2] = max(p[0], min(p[1], have))
+
+    def present():
+        return sum(p[2] - p[0] for p in parts)
+
+    _COUNT["bytes"] = present()
+    progress(job_id, "download", present(), total)
+    watch = SpeedWatch(total, present())
+    stop = {"err": None}
+    fd = os.open(seg, os.O_RDWR)
+    saved = [time.time()]
+    try:
+        def part(i):
+            nonlocal referer      # a 403 on any part arms it for all
+            stalls = 0
+            resumes = 0
+            while True:
+                if stop["err"] is not None:
+                    return
+                start, end, pos = parts[i]
+                if pos >= end:
+                    return
+                got, cut = 0, None
+                r = None
+                try:
+                    try:
+                        r = urllib.request.urlopen(
+                            _dl_request(url, referer, pos, end),
+                            timeout=180)
+                    except urllib.error.HTTPError as ex:
+                        if ex.code in (401, 403, 451) and not referer:
+                            referer = True
+                            continue
+                        raise CdnError("part %d: HTTP %s"
+                                       % (i + 1, ex.code))
+                    code = getattr(r, "status", 0) or r.getcode()
+                    if code != 206:
+                        raise CdnError("part %d: HTTP %s for Range "
+                                       "bytes=%d-%d"
+                                       % (i + 1, code, pos, end - 1))
+                    ctype = (r.headers.get("Content-Type")
+                             or "").lower()
+                    if ctype.startswith(ERROR_CTYPES):
+                        raise CdnError("CDN served an error page (%s) "
+                                       "mid-file — the link died"
+                                       % ctype)
+                    while True:
+                        if stop["err"] is not None:
+                            return
+                        try:
+                            chunk = r.read(1 << 22)
+                        except Exception as ex:
+                            partial = getattr(ex, "partial", b"") or b""
+                            cut = ex
+                            if partial:
+                                chunk = partial
+                            else:
+                                break
+                        if not chunk:
+                            break
+                        if len(chunk) > end - pos:
+                            chunk = chunk[:end - pos]
+                        if not chunk:
+                            break
+                        os.pwrite(fd, chunk, pos)
+                        pos += len(chunk)
+                        got += len(chunk)
+                        parts[i][2] = pos
+                        d = present()
+                        _COUNT["bytes"] = d
+                        progress(job_id, "download", d, total)
+                        rate = watch.update(d)
+                        bad = watch.verdict(d)
+                        if bad:
+                            stop["err"] = bad
+                            raise CdnError(bad)
+                        now = time.time()
+                        if now - saved[0] >= 3.0:
+                            with lock:
+                                if now - saved[0] >= 3.0:
+                                    saved[0] = now
+                                    _save_state(state, url, total,
+                                                parts)
+                        if cut is not None:
+                            break
+                except CdnError:
+                    raise
+                except Exception as ex:
+                    cut = ex
+                finally:
+                    if r is not None:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
+                if parts[i][2] >= end:
+                    return
+                if got:
+                    stalls = 0
+                    resumes += 1
+                    if resumes > MAX_RESUME:
+                        raise CdnError("part %d: CDN cut it %d times, "
+                                       "still %d/%d B"
+                                       % (i + 1, resumes, parts[i][2],
+                                          end))
+                    log("part", i + 1, "resume", resumes, "-",
+                        parts[i][2], "/", end, "B")
+                    time.sleep(0.15)
+                    continue
+                stalls += 1
+                if stalls >= STALL_LIMIT:
+                    raise CdnError("part %d: no progress at %d/%d B "
+                                   "(%s)" % (i + 1, parts[i][2], end,
+                                             repr(cut)[:70] if cut
+                                             else "EOF"))
+                time.sleep(0.8 * stalls)
+
+        ex_pool = ThreadPoolExecutor(max_workers=len(parts))
+        try:
+            futs = [ex_pool.submit(part, i) for i in range(len(parts))]
+            errs = []
+            for f in futs:
+                try:
+                    f.result()
+                except Exception as exc:
+                    errs.append(exc)
+                    stop["err"] = stop["err"] or repr(exc)[:120]
+            if errs:
+                raise errs[0]
+        finally:
+            ex_pool.shutdown(wait=True)
+        _save_state(state, url, total, parts)
+        got_total = present()
+        if got_total < total or os.path.getsize(seg) != total:
+            raise CdnError("parallel download incomplete: %d/%d B"
+                           % (got_total, total))
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    if total < MIN_VIDEO_BYTES:
+        raise CdnError("file is only %d B — no episode is that small"
+                       % total)
+    try:
+        os.remove(state)
+    except Exception:
+        pass
+    os.replace(seg, path)          # only a COMPLETE file lands here
+    _COUNT["bytes"] = total
+    progress(job_id, "download", total, total)
+    log("parallel download done:", len(parts), "parts,", total, "B from",
+        _host_of(url))
+    return total
+
+
+def _download_sequential(url, path, job_id, referer=False):
+    """A route that ignores Range (the Cloudflare proxy) or a small
+    file: one connection, resumed after every cut until complete."""
     import http.client
-    referer = False
     resumes = 0
     stalls = 0
+    watch = None
     while True:
         have = os.path.getsize(path) if os.path.exists(path) else 0
         done, total, cut, ignored = have, 0, None, False
@@ -272,6 +683,8 @@ def _download_route(url, path, job_id):
                 ignored = bool(have)   # our Range was thrown away
             else:
                 raise CdnError("HTTP %s" % code)
+            if watch is None and total:
+                watch = SpeedWatch(total, done)
             with open(path, mode) as fh:
                 while True:
                     try:
@@ -305,6 +718,11 @@ def _download_route(url, path, job_id):
                     done += len(chunk)
                     _COUNT["bytes"] = done
                     progress(job_id, "download", done, total)
+                    if watch is not None:
+                        watch.update(done)
+                        bad = watch.verdict(done)
+                        if bad:
+                            raise CdnError(bad)
         except CdnError:
             raise
         finally:
