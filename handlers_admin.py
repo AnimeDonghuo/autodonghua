@@ -761,17 +761,55 @@ async def _worker_autoupdate(st):
         print("[vps] auto-update error:", repr(exc)[:120])
 
 
+async def _disk_low_warn(st):
+    """The worker sweeps its own dl/ folder at boot and between
+    jobs, so a low VPS disk means something ELSE is filling it —
+    tell the owner (once per hour) before downloads start dying on
+    ENOSPC."""
+    try:
+        mb = (st.get("caps") or {}).get("disk_mb")
+        if not isinstance(mb, int) or mb < 0 or mb >= 1024:
+            return
+        if time.time() - (st.get("disk_warn") or 0) < 3600:
+            return
+        v = dict(st)
+        v["disk_warn"] = time.time()
+        await store.set_config("vps", v)
+        import autodl
+        await autodl._owner_dm(
+            f"⚠️ <b>VPS disk low</b> — only <b>{mb} MB</b> free. "
+            f"The worker auto-cleans its download folder every job "
+            f"and at boot, so something else is filling the disk — "
+            f"check <code>~/vpsnode</code> over SSH. Downloads may "
+            f"fail until space is freed (Koyeb falls back per "
+            f"file).")
+        print(f"[vps] low-disk warning sent ({mb} MB free)")
+    except Exception as exc:
+        print("[vps] disk warn error:", repr(exc)[:120])
+
+
 async def vps_watchdog_loop():
-    """Every 5 min: if the mode is ON and the worker went silent,
-    restart it on the VPS; if it is online but OUTDATED, auto-update
-    it; tell the owner when even that fails (once per hour)."""
+    """Every 5 min: sweep Koyeb's download dir (orphans from
+    abandoned ingests / hard crashes); if the mode is ON and the
+    worker went silent, restart it on the VPS; if it is online but
+    OUTDATED, auto-update it; warn on a low VPS disk and tell the
+    owner when even a restart fails (once per hour each)."""
     while True:
+        try:  # Koyeb disk hygiene — runs at boot and every tick
+            import autodl
+            n, mb = autodl.sweep_orphans()
+            if n:
+                print(f"[vps] Koyeb orphan sweep: {n} file(s), "
+                      f"{mb} MB reclaimed")
+        except Exception as exc:
+            print("[vps] orphan sweep error:", repr(exc)[:120])
         await asyncio.sleep(300)
         try:
             st = await vps_state()
             if not st.get("ssh"):
                 continue
             if st.get("online"):
+                await _disk_low_warn(st)
                 # outdated worker? refresh it even while the mode is
                 # OFF — per-batch 🖥 VPS picks still need it current
                 await _worker_autoupdate(st)

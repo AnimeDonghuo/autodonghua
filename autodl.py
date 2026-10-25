@@ -935,6 +935,35 @@ def _free_up(need_mb=900):
         return 0
 
 
+def sweep_orphans(max_age_h=12):
+    """Koyeb-side disk hygiene (every watchdog tick): ANY file in
+    DOWNLOAD_DIR older than max_age_h is trash — abandoned /fast
+    ingests whose confirm menu was never tapped, leftovers of a
+    hard-crashed job (normal jobs remove their file in run_job's
+    finally; active downloads refresh their mtime with every chunk
+    and a single file times out at 90 min, far below the cutoff).
+    Returns (files, MB) reclaimed."""
+    now = time.time()
+    n = mb = 0
+    try:
+        for f in os.listdir(DOWNLOAD_DIR):
+            p = os.path.join(DOWNLOAD_DIR, f)
+            try:
+                if not os.path.isfile(p):
+                    continue
+                if now - os.path.getmtime(p) < max_age_h * 3600:
+                    continue
+                mb += os.path.getsize(p) // 1048576
+                os.remove(p)
+                n += 1
+                print("[autodl] orphan sweep: removed", f)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return n, mb
+
+
 VPS_JOB_TIMEOUT = 20 * 60
 
 

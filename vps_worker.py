@@ -8,9 +8,13 @@ the light work: reference copies, posters, cards, DMs, registry.
 Deployed & supervised by the bot itself over SSH (/addvps).
 Talks to the Koyeb instance over HTTPS with the shared secret.
 Needs ONLY telethon (+ optional Pillow/hachoir). Config file
-vps_worker.json sits next to this file. Files are deleted right
-after a successful upload; live progress is reported so the Koyeb
-/status panel shows the job exactly like a local one.
+vps_worker.json sits next to this file. Files are deleted after
+EVERY job — win, fail or exception — and an orphan sweep runs at
+boot and between jobs (a kill/reboot mid-download never executes
+cleanup, so boot wipes whatever is left); worker.log is capped at
+~4 MB. The VPS is built to run for months unattended without its
+disk filling up. Live progress is reported so the Koyeb /status
+panel shows the job exactly like a local one.
 """
 import base64
 import json
@@ -25,7 +29,7 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 
-WORKER_BUILD = "3"   # bump on EVERY worker change — the watchdog
+WORKER_BUILD = "4"   # bump on EVERY worker change — the watchdog
 #                    # auto-updates VPSes whose beat reports an older one
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +98,38 @@ def _dl_request(url, referer=False):
     return urllib.request.Request(url, headers=h)
 
 
+def sweep(max_age_min=10):
+    """Disk hygiene — the VPS must outlive months of unattended
+    runs. This script is single-threaded, so between jobs NOTHING
+    in dl/ is active: every file older than max_age_min is an
+    orphan from a killed/crashed run and goes. Boot calls sweep(0)
+    — a SIGTERM or reboot mid-download can't run finally blocks,
+    so startup wipes the folder outright. worker.log is capped too
+    (the shell redirect appends, so truncating is safe — the fd
+    keeps writing at the new EOF)."""
+    now = time.time()
+    try:
+        for f in os.listdir(DL):
+            p = os.path.join(DL, f)
+            try:
+                if os.path.isfile(p) and \
+                        now - os.path.getmtime(p) >= max_age_min * 60:
+                    os.remove(p)
+                    log("sweep: removed orphan", f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        lp = os.path.join(HERE, "worker.log")
+        if os.path.getsize(lp) > 4 * 1048576:
+            with open(lp, "r+") as fh:
+                fh.truncate(0)
+            log("sweep: worker.log truncated (>4 MB)")
+    except Exception:
+        pass
+
+
 def download(url, path, job_id):
     t0 = time.time()
     done = 0
@@ -154,47 +190,54 @@ def run_one(job, client):
     name = "".join(c if c.isalnum() or c in "._- " else "_"
                    for c in (job.get("filename") or "video.mp4"))
     path = os.path.join(DL, name)
-    _COUNT.update(bytes=0, t0=time.time())
-    log(f"job {jid}: downloading {job['url'][:70]}")
-    size, speed = download(job["url"], path, jid)
-    thumb = None
-    if job.get("thumb_b64"):
-        try:
-            thumb = base64.b64decode(job["thumb_b64"])
-        except Exception:
-            thumb = None
-    log(f"job {jid}: downloaded {size} B at {speed:.1f} MB/s — "
-        f"uploading to {job['channel']}")
-    _COUNT.update(bytes=0, t0=time.time())
-    up = {"last": 0.0}
-
-    def up_cb(sent_bytes, total_bytes):
-        now = time.time()
-        if now - up["last"] < 3:
-            return
-        up["last"] = now
-        _COUNT["bytes"] = sent_bytes
-        progress(jid, "upload", sent_bytes, total_bytes)
-
-    sent = client.send_file(
-        job["channel"], file=path, caption=job.get("caption") or "",
-        thumb=thumb, supports_streaming=True,
-        attributes=video_attrs(path, name),
-        progress_callback=up_cb)
-    if hasattr(sent, "__await__"):   # belt & braces: never a coroutine
-        sent = client.loop.run_until_complete(sent)
-    doc = sent.document or sent.video
-    out = {"msg_id": sent.id, "size": size,
-           "speed": round(speed, 2),
-           "doc": {"id": doc.id, "access_hash": doc.access_hash,
-                   "file_reference": base64.b64encode(
-                       doc.file_reference or b"").decode()}}
     try:
-        os.remove(path)  # VPS disk stays clean
-    except Exception:
-        pass
-    log(f"job {jid}: archived msg {sent.id}")
-    return out
+        _COUNT.update(bytes=0, t0=time.time())
+        log(f"job {jid}: downloading {job['url'][:70]}")
+        size, speed = download(job["url"], path, jid)
+        thumb = None
+        if job.get("thumb_b64"):
+            try:
+                thumb = base64.b64decode(job["thumb_b64"])
+            except Exception:
+                thumb = None
+        log(f"job {jid}: downloaded {size} B at {speed:.1f} MB/s — "
+            f"uploading to {job['channel']}")
+        _COUNT.update(bytes=0, t0=time.time())
+        up = {"last": 0.0}
+
+        def up_cb(sent_bytes, total_bytes):
+            now = time.time()
+            if now - up["last"] < 3:
+                return
+            up["last"] = now
+            _COUNT["bytes"] = sent_bytes
+            progress(jid, "upload", sent_bytes, total_bytes)
+
+        sent = client.send_file(
+            job["channel"], file=path,
+            caption=job.get("caption") or "",
+            thumb=thumb, supports_streaming=True,
+            attributes=video_attrs(path, name),
+            progress_callback=up_cb)
+        if hasattr(sent, "__await__"):  # belt & braces: never a coroutine
+            sent = client.loop.run_until_complete(sent)
+        doc = sent.document or sent.video
+        out = {"msg_id": sent.id, "size": size,
+               "speed": round(speed, 2),
+               "doc": {"id": doc.id,
+                       "access_hash": doc.access_hash,
+                       "file_reference": base64.b64encode(
+                           doc.file_reference or b"").decode()}}
+        log(f"job {jid}: archived msg {sent.id}")
+        return out
+    finally:
+        # win, fail, exception or half-downloaded chunk — the file
+        # NEVER outlives its job; the VPS disk is the worker's
+        # lifeline (boot sweep catches even a hard kill)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 def main():
@@ -206,9 +249,12 @@ def main():
     if CFG["base"] and "://" not in CFG["base"]:
         CFG["base"] = "https://" + CFG["base"]  # bare host ok
     os.makedirs(DL, exist_ok=True)
+    sweep(0)   # boot wipe: anything in dl/ is a leftover of a
+               # killed run (SIGTERM/reboot never runs cleanup)
     client = None
     log(f"worker starting → {CFG['base']}")
     while True:
+        sweep()   # between-job orphan check + worker.log cap
         try:
             api("/vps/beat", {"secret": CFG["secret"],
                               "caps": caps()})
