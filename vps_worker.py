@@ -165,6 +165,9 @@ def main():
     if not os.path.exists(CFG_PATH):
         sys.exit("vps_worker.json missing — run /addvps again")
     CFG = json.load(open(CFG_PATH))
+    CFG["base"] = (CFG.get("base") or "").strip().rstrip("/")
+    if CFG["base"] and "://" not in CFG["base"]:
+        CFG["base"] = "https://" + CFG["base"]  # bare host ok
     os.makedirs(DL, exist_ok=True)
     client = None
     log(f"worker starting → {CFG['base']}")

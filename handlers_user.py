@@ -366,6 +366,7 @@ KNOWN_COMMANDS = {
     "autodl", "checknew", "setstartimg",
     "adddbchannel", "dbchannels", "deldbchannel", "settag",
     "status", "addmongo", "cancel",
+    "addvps", "vps", "removevps", "searchad", "syncbutton", "setowner",
 }
 
 

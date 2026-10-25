@@ -300,6 +300,18 @@ async def cmd_setowner(e):
 VPS_DIR = "vpsnode"
 
 
+def _norm_base(b):
+    """Accept 'app.koyeb.app' OR 'https://app.koyeb.app' — always store a
+    scheme'd root. A bare host silently broke every worker heartbeat
+    (urllib: 'unknown url type')."""
+    b = (b or "").strip().strip('"').strip("'")
+    if not b:
+        return ""
+    if "://" not in b:
+        b = "https://" + b
+    return b.rstrip("/")
+
+
 def _ssh_client(cfg):
     import paramiko
     cli = paramiko.SSHClient()
@@ -433,21 +445,45 @@ async def _provision(chat_id, msg):
             os.path.dirname(os.path.abspath(__file__)),
             "vps_worker.py"), "rb").read()
         await ssh_put(cfg, worker, f"{home}/{VPS_DIR}/vps_worker.py")
-        conf = json.dumps({"base": v.get("base"),
+        conf = json.dumps({"base": _norm_base(v.get("base")),
                            "secret": v.get("secret")})
         await ssh_put(cfg, conf.encode(),
                       f"{home}/{VPS_DIR}/vps_worker.json")
         await ssh_exec(cfg, f"chmod 600 {home}/{VPS_DIR}/"
                             "vps_worker.json", 20)
-        cron = (f"@reboot cd {home}/{VPS_DIR} && nohup python3 "
+        cron = (f"@reboot cd {home}/{VPS_DIR} && nohup python3 -u "
                 f"vps_worker.py >> worker.log 2>&1 &")
         await ssh_exec(cfg, f"(crontab -l 2>/dev/null | grep -v "
                             f"vps_worker.py; echo '{cron}') | crontab -",
                        30)
-        await ssh_exec(cfg, f"pkill -f vps_worker.py; sleep 1; "
-                            f"cd {home}/{VPS_DIR} && nohup python3 "
+        base_url = _norm_base(v.get("base"))
+        if msg:
+            await flood_edit(msg, f"🌍 Checking <code>"
+                                  f"{escape_html(base_url)}</code> is "
+                                  f"reachable from the VPS…",
+                             parse_mode="html")
+        probe = ("python3 -c 'import urllib.request,urllib.error\n"
+                 "try:\n"
+                 "    c=urllib.request.urlopen(urllib.request.Request(\""
+                 + base_url + "/vps/job\"),timeout=15).status\n"
+                 "except urllib.error.HTTPError as e:\n"
+                 "    c=e.code\n"
+                 "except Exception:\n"
+                 "    c=0\n"
+                 "print(c)'")
+        rc, out, _ = await ssh_exec(cfg, probe, 60)
+        got = (out or "").strip().splitlines()
+        code = got[-1].strip() if got else "?"
+        if code not in ("200", "401"):
+            raise RuntimeError(
+                f"Koyeb url NOT reachable from the VPS (HTTP {code}) — "
+                f"it must be THIS bot's service url, like "
+                f"https://your-app.koyeb.app. Fix it with /addvps or "
+                f"/vps redeploy.")
+        await ssh_exec(cfg, f"pkill -f '[v]ps_worker.py'; sleep 1; "
+                            f"cd {home}/{VPS_DIR} && nohup python3 -u "
                             f"vps_worker.py >> worker.log 2>&1 & "
-                            f"sleep 2; pgrep -f vps_worker.py", 60)
+                            f"sleep 2; pgrep -f '[v]ps_worker.py'", 60)
         if msg:
             await flood_edit(msg, "💓 Waiting for worker heartbeat…",
                              parse_mode="html")
@@ -462,7 +498,9 @@ async def _provision(chat_id, msg):
                 cfg, f"tail -5 {home}/{VPS_DIR}/worker.log 2>/dev/null",
                 30)
             raise RuntimeError("worker did not heartbeat — log: "
-                               + out[-200:])
+                               + (out.strip()[-200:] or "(empty)")
+                               + " — is the url THIS bot's Koyeb "
+                                 "service? then /vps redeploy")
         st = await vps_state()
         caps = st.get("caps") or {}
         yes = lambda k: "✓" if caps.get(k) else "✗"
@@ -480,6 +518,15 @@ async def _provision(chat_id, msg):
                              parse_mode="html")
     except Exception as exc:
         await _vps_fail(msg, "provisioning", exc)
+        if msg:
+            try:
+                await flood_respond(
+                    msg, "💡 Fix the issue above, then send "
+                         "<code>/vps redeploy</code> to retry — or "
+                         "<code>/removevps</code> to start over.",
+                    parse_mode="html")
+            except Exception:
+                pass
 
 
 @app.on(events.NewMessage(pattern=r"^/addvps(?:\s+(.+))?$"))
@@ -493,7 +540,7 @@ async def cmd_addvps(e):
     args = parts[1].split() if len(parts) > 1 else []
     if len(args) >= 4:
         user, host, pw, token = args[:4]
-        base = args[4] if len(args) > 4 else ""
+        base = _norm_base(args[4] if len(args) > 4 else "")
     else:
         await flood_respond(e, "🖥 <b>Add your VPS</b> — answer the "
                                "next questions here (the bot installs "
@@ -506,10 +553,12 @@ async def cmd_addvps(e):
         token = await _ask(e, "4️⃣ <b>Worker bot token</b> — a SECOND "
                               "bot from @BotFather (never the main "
                               "bot token)?")
-        base = await _ask(e, "5️⃣ Koyeb base url "
-                             "(https://….koyeb.app)? send "
-                             "<code>-</code> to keep the stored one")
-        base = "" if base in ("-", None) else base
+        base = await _ask(e, "5️⃣ Koyeb base url of THIS bot — the "
+                             "service link Koyeb gave you, e.g. "
+                             "<code>https://your-app.koyeb.app</code> "
+                             "(a bare your-app.koyeb.app is fine too). "
+                             "Send <code>-</code> to keep the stored one")
+        base = "" if base in ("-", None) else _norm_base(base)
         if not (host and pw and token):
             return await flood_respond(e, "❌ VPS setup cancelled — "
                                           "missing answers.")
@@ -517,7 +566,7 @@ async def cmd_addvps(e):
     v.update({"ssh": {"host": host.strip(), "user": user.strip(),
                       "pass": pw.strip()},
               "token": token.strip(),
-              "base": (base or v.get("base") or "").rstrip("/"),
+              "base": _norm_base(base or v.get("base") or ""),
               "secret": v.get("secret") or secrets.token_hex(8),
               "enabled": False, "beat": 0})
     await store.set_config("vps", v)
@@ -530,7 +579,7 @@ async def cmd_addvps(e):
     asyncio.ensure_future(_provision(e.chat_id, msg))
 
 
-@app.on(events.NewMessage(pattern=r"^/vps(?:\s+(on|off))?$"))
+@app.on(events.NewMessage(pattern=r"^/vps(?:\s+(on|off|check|redeploy|fix))?$"))
 async def cmd_vps(e):
     """Show / toggle the VPS mode: ON = VPS downloads+uploads and
     Koyeb only posts; OFF = Koyeb handles everything alone."""
@@ -541,6 +590,50 @@ async def cmd_vps(e):
         return await flood_respond(e, "🖥 No VPS registered — "
                                       "/addvps first.")
     arg = e.pattern_match.group(1)
+    if arg in ("redeploy", "fix"):
+        if not (v.get("ssh") and v.get("token")):
+            return await flood_respond(e, "❌ Nothing to redeploy — "
+                                          "/addvps first.")
+        msg = await flood_respond(e, "🛠 <b>Re-deploying the VPS "
+                                     "worker…</b>", parse_mode="html")
+        asyncio.ensure_future(_provision(e.chat_id, msg))
+        return
+    if arg == "check":
+        ssh = v.get("ssh")
+        lines = ["🩺 <b>VPS worker check</b>"]
+        if ssh:
+            try:
+                _, out, _e = await ssh_exec(
+                    ssh, "pgrep -f '[v]ps_worker.py' >/dev/null 2>&1 "
+                         "&& echo RUNNING || echo STOPPED", 25)
+                lines.append("Process: <code>"
+                             + escape_html((out or "?").strip()) + "</code>")
+                _, lg, _e = await ssh_exec(
+                    ssh, f"tail -n 8 ~/{VPS_DIR}/worker.log 2>/dev/null",
+                    25)
+                if (lg or "").strip():
+                    lines.append("Log tail:\n<code>"
+                                 + escape_html(lg.strip()[-500:])
+                                 + "</code>")
+                if "STOPPED" in (out or ""):
+                    await ssh_exec(
+                        ssh, f"cd ~/{VPS_DIR} && nohup python3 -u "
+                             f"vps_worker.py >> worker.log 2>&1 & "
+                             f"echo $!", 30)
+                    lines.append("↻ Restarted it — /vps check again "
+                                 "in ~1 min.")
+            except Exception as ex:
+                lines.append("SSH failed: <code>"
+                             + escape_html(str(ex)[:160]) + "</code>")
+        else:
+            lines.append("No SSH details stored — /addvps first.")
+        st2 = await vps_state()
+        lines.append("Koyeb sees it: <b>"
+                     + ("ONLINE ✅" if st2.get("online") else "OFFLINE ❌")
+                     + "</b>"
+                     + (f" · beat {int(time.time() - (st2.get('beat') or 0))}"
+                        f"s ago" if st2.get("online") else ""))
+        return await flood_respond(e, "\n".join(lines), parse_mode="html")
     if arg:
         v["enabled"] = (arg == "on")
         await store.set_config("vps", v)
@@ -584,14 +677,14 @@ async def vps_watchdog_loop():
                     or st.get("online"):
                 continue
             rc, out, _ = await ssh_exec(st["ssh"],
-                                        "pgrep -f vps_worker.py || true",
-                                        40)
+                                        "pgrep -f '[v]ps_worker.py' "
+                                        "|| true", 40)
             if out.strip():
                 continue
             rc, out, _ = await ssh_exec(
-                st["ssh"], "cd $HOME/vpsnode && nohup python3 "
+                st["ssh"], "cd $HOME/vpsnode && nohup python3 -u "
                            "vps_worker.py >> worker.log 2>&1 & "
-                           "sleep 2; pgrep -f vps_worker.py", 60)
+                           "sleep 2; pgrep -f '[v]ps_worker.py'", 60)
             print("[vps] watchdog restart:", out.strip()[:40] or "failed")
             if not out.strip():
                 if time.time() - (st.get("wd_warn") or 0) > 3600:
@@ -614,9 +707,9 @@ async def cmd_removevps(e):
     v = dict(await store.get_config("vps") or {})
     if v.get("ssh"):
         try:
-            await ssh_exec(v["ssh"], "pkill -f vps_worker.py; "
+            await ssh_exec(v["ssh"], "pkill -f '[v]ps_worker.py'; "
                            "crontab -l 2>/dev/null | grep -v "
-                           "vps_worker.py | crontab -", 60)
+                           "'[v]ps_worker.py' | crontab -", 60)
         except Exception as exc:
             await flood_respond(e, f"⚠️ Worker could not be stopped "
                                    f"over SSH: "
