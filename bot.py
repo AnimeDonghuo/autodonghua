@@ -53,6 +53,15 @@ async def main():
     asyncio.ensure_future(autodl.panel_loop())
     print(autodl.telethon_info() + " · build " + autodl.BUILD)
 
+    # command-menu auto-sync: every deploy pushes the CURRENT
+    # COMMAND_MENU to Telegram, so the '/' menu always matches the
+    # real handlers — nobody has to remember /sync after an update
+    try:
+        n_cmds = await handlers_admin.sync_command_menu()
+        print(f"[boot] command menu synced — {n_cmds} commands")
+    except Exception as exc:
+        print("[boot] command menu sync failed:", repr(exc)[:120])
+
     async def _resume_batch():
         """Restart mid-batch? Continue where it left off: anything
         absent from the registry (or a batch still pending when we

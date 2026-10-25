@@ -34,36 +34,62 @@ from parser import normalize_key
 from style import ADMIN_HOME, escape_html
 
 COMMAND_MENU = [
+    # — user —
     ("start", "Start the bot"),
-    ("help", "Help"),
+    ("help", "Help & command list"),
     ("request", "Request an anime / donghua"),
     ("search", "Search the file store"),
-    ("addchannel", "Add a posting channel"),
-    ("buttonchannel", "Add a menu button channel"),
-    ("forcesub", "Force-subscribe settings"),
-    ("backup", "Backup the database"),
-    ("recover", "Restore from a backup file"),
-    ("addmongodb", "Add a MongoDB URI"),
-    ("searchad", "Admin: force re-download any ep from the API"),
-    ("syncbutton", "Admin: sync card buttons + fetch late eng subs"),
-    ("sync", "Sync bot command menu"),
-    ("usage", "Storage & usage stats"),
-    ("autodl", "Start/stop the API download watcher"),
+    ("get", "Get a stored file by link/tag"),
+    ("login", "Staff login"),
+    ("logout", "Staff logout"),
+    # — watching & downloading —
     ("status", "Live bot status panel"),
     ("checknew", "Check new episodes interactively"),
-    ("stats", "Bot stats"),
-    ("get", "Get a stored file by link/tag"),
-    ("settag", "Set a channel tag (eng = eng subs only)"),
-    ("adddbchannel", "Add a TG archive DB channel"),
-    ("dbchannels", "List DB channels"),
-    ("deldbchannel", "Remove a DB channel"),
-    ("setdbchannel", "Set the single legacy DB channel"),
-    ("setstartimg", "Set the /start banner image"),
-    ("addvps", "Add + auto-provision a VPS upload worker"),
-    ("vps", "VPS mode on/off + worker status"),
-    ("removevps", "Remove the VPS worker"),
+    ("autodl", "Start/stop the API download watcher"),
     ("cancelall", "Stop ALL running & queued download jobs"),
+    ("searchad", "Admin: force re-download any ep from the API"),
+    ("fixsmall", "Find & repair tiny broken archives (dead links)"),
+    # — VPS worker —
+    ("vps", "VPS mode on/off + worker status"),
+    ("addvps", "Add + auto-provision a VPS upload worker"),
+    ("removevps", "Remove the VPS worker"),
     ("parallel", "Run Koyeb + VPS download lanes at once"),
+    # — channels & archive —
+    ("channels", "List posting channels"),
+    ("addchannel", "Add a posting channel"),
+    ("buttonchannel", "Add a menu button channel"),
+    ("buttonchannels", "List menu button channels"),
+    ("forcesub", "Force-subscribe settings"),
+    ("dbchannels", "List archive DB channels"),
+    ("adddbchannel", "Add a TG archive DB channel"),
+    ("deldbchannel", "Remove a DB channel"),
+    ("dbchannel", "Set the single legacy DB channel"),
+    ("setdbchannel", "Set the single legacy DB channel"),
+    ("settag", "Set a channel tag (eng = eng subs only)"),
+    ("setlog", "Set the log channel"),
+    # — database & backup —
+    ("addmongodb", "Add a MongoDB URI (persistent)"),
+    ("mongos", "List configured MongoDB URIs"),
+    ("delmongodb", "Remove a MongoDB by number"),
+    ("backup", "Backup the database"),
+    ("recover", "Restore from a backup file"),
+    # — staff & users —
+    ("admins", "List admins"),
+    ("addadmin", "Promote an admin"),
+    ("deladmin", "Demote an admin"),
+    ("setowner", "Claim/transfer the owner"),
+    ("setpass", "Set the staff password"),
+    ("users", "List known users"),
+    ("setpaid", "Mark a user paid/free"),
+    ("broadcast", "Broadcast a message"),
+    ("usage", "Storage & usage stats"),
+    ("stats", "Bot stats"),
+    # — looks, sources & sync —
+    ("setimg", "Set a custom poster image"),
+    ("setstartimg", "Set the /start banner image"),
+    ("setsource", "Set the metadata source base URL"),
+    ("syncbutton", "Sync card buttons + fetch late eng subs"),
+    ("sync", "Refresh the bot command menu"),
 ]
 
 
@@ -1362,16 +1388,26 @@ async def cmd_setsource(e):
                         parse_mode="html")
 
 
+async def sync_command_menu() -> int:
+    """Push COMMAND_MENU to Telegram so the '/' autocomplete menu
+    matches the handlers that actually exist. Runs at BOOT on every
+    deploy — a stale menu used to hide each new command until
+    somebody remembered to type /sync — and on manual /sync."""
+    cmds = [BotCommand(c, d) for c, d in COMMAND_MENU]
+    await app(SetBotCommandsRequest(
+        commands=cmds, scope=BotCommandScopeDefault(), lang_code=""))
+    return len(cmds)
+
+
 @app.on(events.NewMessage(pattern=r"^/sync$"))
 async def cmd_sync(e):
     if not await require_staff(e):
         return
-    cmds = [BotCommand(c, d) for c, d in COMMAND_MENU]
-    await app(SetBotCommandsRequest(commands=cmds,
-                                    scope=BotCommandScopeDefault(), lang_code=""))
-    await flood_respond(e, f"✅ <b>Commands synced!</b> {len(cmds)} commands are now "
+    n = await sync_command_menu()
+    await flood_respond(e, f"✅ <b>Commands synced!</b> {n} commands are now "
                     f"visible in the bot menu:\n\n" +
-                    "\n".join(f"• <code>/{c}</code> — {d}" for c, d in COMMAND_MENU),
+                    "\n".join(f"• <code>/{c}</code> — {escape_html(d)}"
+                               for c, d in COMMAND_MENU),
                     parse_mode="html")
 
 
