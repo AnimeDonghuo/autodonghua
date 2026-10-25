@@ -157,6 +157,15 @@ async def cmd_checknew(e):
                         parse_mode="html")
     fresh = await autodl.check_new()
     if not fresh:
+        if autodl.API_ERR.get("ts"):
+            return await m.edit(
+                "⚠️ <b>Source API unreachable</b> — <code>"
+                + str(autodl.API_ERR.get("err", ""))[:120]
+                      .replace("&", "&amp;").replace("<", "&lt;")
+                      .replace(">", "&gt;")
+                + "</code>\nNothing can be checked until it "
+                  "responds; the watcher retries every cycle.",
+                parse_mode="html")
         return await m.edit(
             "✅ <b>No new episodes</b> — everything the API "
             "lists is already in the registry.",
@@ -337,6 +346,18 @@ async def _status_head():
             f" · every {st.get('interval', 20)} min\n"
             f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
             f"{autodl.telethon_info()} · build {autodl.BUILD}\n")
+    w = await store.get_config("watch") or {}
+    if w.get("ts"):
+        age = max(0, int((time.time() - w["ts"]) / 60))
+        if w.get("err"):
+            res = ("❌ " + str(w["err"])[:90].replace("&", "&amp;")
+                                 .replace("<", "&lt;")
+                                 .replace(">", "&gt;"))
+        elif (w.get("fresh") or 0) > 0:
+            res = f"🆕 {w['fresh']} episode(s) missing → queued"
+        else:
+            res = "registry up to date, nothing new to fetch"
+        head += f"👀 Last check: {age} min ago — {res}\n"
     v = await vps_state()
     if v.get("secret"):
         caps = v.get("caps") or {}

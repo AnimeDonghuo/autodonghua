@@ -41,7 +41,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
-BUILD = "2026-10-21-d"  # stamp shown in /status — proves deploy freshness
+BUILD = "2026-10-25-a"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
@@ -89,6 +89,14 @@ async def fetch_latest(sections=None):
             seen.add(item.get("id"))
             item.setdefault("section", sec)
             out.append(item)
+    if secs and all(isinstance(r, BaseException) for r in res):
+        # EVERY source failed — that's an outage, not an empty
+        # schedule; the watcher and /status must tell them apart
+        API_ERR["ts"] = time.time()
+        API_ERR["err"] = repr(res[0])[:160]
+    else:
+        API_ERR["ts"] = 0.0
+        API_ERR["err"] = ""
     return out
 
 
@@ -260,6 +268,9 @@ CURRENT2 = None    # lane 2 — /parallel batches & a 2nd concurrent batch
 BATCHES = {}       # id(state) -> per-batch state; a Koyeb batch and a
                    # VPS batch can run AT THE SAME TIME (separate
                    # machines), so counters/stop-flags are per-batch
+API_ERR = {"ts": 0.0, "err": ""}  # set when EVERY source section fails —
+                                  # an outage, not "nothing new"
+_LOOP_WARN = {"ts": 0.0}          # hourly gate for watcher error DMs
 
 
 def busy() -> bool:
@@ -282,6 +293,37 @@ def _batch_agg():
     """Combined n/total across every active batch (panel header)."""
     return (sum(s["n"] for s in BATCHES.values()),
             sum(s["total"] for s in BATCHES.values()))
+
+
+async def _watch_mark(fresh=None, err=""):
+    """Persist the watcher's last pass (when + result). /status
+    renders it, so 'is the watcher alive / why no downloads' is
+    never a guessing game again."""
+    try:
+        await store.set_config("watch", {
+            "ts": time.time(),
+            "fresh": -1 if fresh is None else int(fresh),
+            "err": (err or "")[:200]})
+    except Exception:
+        pass
+
+
+async def _loop_warn(msg):
+    """Owner DM for watcher-level failures, hourly-gated. A silent
+    log-only error is exactly how 'the bot just stopped downloading'
+    happens — the owner must HEAR it (at most once an hour)."""
+    try:
+        now = time.time()
+        if now - _LOOP_WARN.get("ts", 0) < 3600:
+            return
+        _LOOP_WARN["ts"] = now
+        await _owner_dm(
+            "❌ <b>AutoDL watcher</b>\n<code>"
+            + escape_html(str(msg))[:400]
+            + "</code>\nThe loop keeps retrying on its own — this "
+              "warning repeats at most once an hour.")
+    except Exception:
+        pass
 
 
 def cancel_all() -> int:
@@ -424,8 +466,11 @@ def job_panel(job=None) -> str:
         job = CURRENT or CURRENT2
     agg_n, agg_total = _batch_agg()
     if job is None:
-        lines.append(f"⏳ {agg_total} file(s) queued — "
-                     f"starting…")
+        if agg_total:
+            lines.append(f"⏳ {agg_total} file(s) queued — "
+                         f"starting…")
+        else:
+            lines.append("💤 Idle — nothing downloading right now")
     else:
         state = {"running": ("Running" if job["phase"] == "download"
                              else "Running"),
@@ -1306,18 +1351,21 @@ async def run_batch(fresh, force=False, executor="auto", locks=()):
     st = {"n": 0, "total": total, "skip": 0, "stop": False,
           "ok": 0, "bad": 0, "can": 0, "locks": tuple(locks),
           "panel": not BATCHES}
-    BATCHES[id(st)] = st
-    if st["panel"]:
-        msg = await _owner_dm(job_panel(None), buttons=PANEL_BUTTONS)
-        if msg is not None:
-            await set_live_panel(getattr(msg, "chat_id", None),
-                                 getattr(msg, "id", None))
     done = 0
-    par = False
-    if executor == "auto" and await _parallel_on():
-        _st = await core_mod.vps_state()
-        par = bool(_st.get("online"))
+    BATCHES[id(st)] = st
     try:
+        # everything from registration on lives INSIDE the try — an
+        # exception anywhere must still pop the batch state, or
+        # every later batch loses its panel, summary and cleanup
+        if st["panel"]:
+            msg = await _owner_dm(job_panel(None), buttons=PANEL_BUTTONS)
+            if msg is not None:
+                await set_live_panel(getattr(msg, "chat_id", None),
+                                     getattr(msg, "id", None))
+        par = False
+        if executor == "auto" and await _parallel_on():
+            _st = await core_mod.vps_state()
+            par = bool(_st.get("online"))
         if par:
             # 🔀 PARALLEL — two fully independent lanes: each lane
             # OWNS whole animes (or, for a single-anime batch, whole
@@ -2327,17 +2375,25 @@ async def eng_pending_loop():
 
 
 async def autodl_loop():
-    """Background watcher — polls the API for new episodes."""
+    """Background watcher — polls the API for new episodes.
+    This loop must NEVER die and never fail silently: a dead
+    watcher looks exactly like 'the bot stopped downloading' while
+    /status stays healthy — so every pass stamps its result into
+    the 'watch' config (rendered by /status) and real failures
+    reach the owner's DM (hourly-gated)."""
     await asyncio.sleep(30)  # let the bot settle first
     running = False
     while True:
+        interval = 20
         try:
             st = await get_settings()
+            interval = st.get("interval", 20)
             if st["enabled"] and not running:
                 running = True
                 try:
                     fresh = await check_new()
                     if fresh:
+                        await _watch_mark(len(fresh))
                         if busy():
                             print("[autodl] batch already running — "
                                   "watcher skips re-queueing")
@@ -2345,9 +2401,24 @@ async def autodl_loop():
                             print(f"[autodl] {len(fresh)} episode(s) "
                                   f"missing from the DB — queueing")
                             await start_batch(fresh)
+                    elif API_ERR.get("ts"):
+                        # every source section failed — outage, not
+                        # 'nothing new'; say so in status AND DM
+                        await _watch_mark(0, "source API unreachable: "
+                                          + API_ERR.get("err", ""))
+                        await _loop_warn("source API unreachable — "
+                                         + API_ERR.get("err", ""))
+                    else:
+                        await _watch_mark(0)
                 finally:
                     running = False
         except Exception as exc:
-            print("[autodl] loop error:", exc)
-        st = await get_settings()
-        await asyncio.sleep(max(60, st.get("interval", 20)) * 60)
+            print("[autodl] loop error:", repr(exc)[:200])
+            await _watch_mark(None, repr(exc)[:200])
+            await _loop_warn(f"watcher pass crashed: {exc!r}")
+        try:  # re-read the interval — but NEVER die on it (an
+            interval = (await get_settings()).get(   # unguarded read
+                "interval", interval)                # here used to be
+        except Exception:                            # able to kill the
+            pass                                     # watcher forever)
+        await asyncio.sleep(max(60, interval) * 60)

@@ -72,6 +72,16 @@ async def main():
                 await autodl.start_batch(fresh)
         except Exception as exc:
             print("[autodl] resume pass failed:", repr(exc)[:200])
+            try:  # never silent — a failed resume means the batch
+                await autodl._owner_dm(   # that died with the restart
+                    "❌ <b>Restart resume failed</b>\n<code>"
+                    + repr(exc)[:300].replace("&", "&amp;")
+                                          .replace("<", "&lt;")
+                                          .replace(">", "&gt;")
+                    + "</code>\nThe watcher retries every cycle — "
+                      "or run /checknew to force it now.")
+            except Exception:
+                pass
     asyncio.ensure_future(_resume_batch())
 
     async def _backlog_pass():
