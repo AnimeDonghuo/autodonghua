@@ -132,7 +132,12 @@ def video_attrs(path, filename):
 def ensure_client(client, creds):
     if client:
         return client
-    from telethon import TelegramClient
+    # telethon.SYNC — a plain (non-async) script must NOT use
+    # telethon.TelegramClient: its send_file is a coroutine, so
+    # 'sent.document' blew up with AttributeError("'coroutine'
+    # object has no attribute 'document'"). The sync client runs
+    # every method to completion and returns the real Message.
+    from telethon.sync import TelegramClient
     client = TelegramClient(os.path.join(HERE, "vpsworker"),
                             creds["api_id"], creds["api_hash"])
     client.start(bot_token=creds["token"])
@@ -173,6 +178,8 @@ def run_one(job, client):
         thumb=thumb, supports_streaming=True,
         attributes=video_attrs(path, name),
         progress_callback=up_cb)
+    if hasattr(sent, "__await__"):   # belt & braces: never a coroutine
+        sent = client.loop.run_until_complete(sent)
     doc = sent.document or sent.video
     out = {"msg_id": sent.id, "size": size,
            "speed": round(speed, 2),
