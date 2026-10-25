@@ -369,7 +369,7 @@ async def _status_head():
             + (f" (beat {int(time.time() - v['beat'])}s ago)"
                if v.get("beat") else "")
             + f" · mode {'ON' if v.get('enabled') else 'off'}\n"
-            f"🖥 py {caps.get('py', '?')} · worker v"
+            f"🖥 py {caps.get('py', '?')} · worker build "
             f"{caps.get('build', '?')} · disk "
             f"{caps.get('disk_mb', '?')} MB free · "
             f"{ssh.get('user', 'root')}@{ssh.get('host', '?')}\n"

@@ -13,6 +13,7 @@ Admin / owner commands.
 /users · /usage · /stats · /broadcast · /setsource anilive <base>
 """
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -682,7 +683,7 @@ async def cmd_vps(e):
         f"runs Koyeb + VPS at the same time",
         f"Caps: py {caps.get('py', '?')} · telethon {yes('telethon')} "
         f"· Pillow {yes('PIL')} · hachoir {yes('hachoir')} · disk "
-        f"{caps.get('disk_mb', '?')} MB · worker v"
+        f"{caps.get('disk_mb', '?')} MB · worker build "
         f"{caps.get('build', '?')}",
         f"Done: <b>{st.get('jobs') or 0}</b> job(s) · "
         f"<b>{round((st.get('bytes') or 0) / 1073741824, 2)} GB</b> "
@@ -698,17 +699,34 @@ async def cmd_vps(e):
 
 
 def _worker_build() -> str:
-    """The build stamp of the vps_worker.py sitting next to this file
-    (the one /vps redeploy + the watchdog ship to the VPS)."""
-    import re as _re
+    """Content-hash of the vps_worker.py sitting next to this file
+    (the one /vps redeploy + the watchdog ship to the VPS). The
+    worker self-hashes the same way, so ANY byte difference —
+    including a change nobody remembered to stamp — trips the
+    auto-update; identical files hash identically, so there are
+    never needless restarts."""
     try:
-        src = open(os.path.join(
+        data = open(os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "vps_worker.py"), encoding="utf-8").read()
-        m = _re.search(r'WORKER_BUILD\s*=\s*"(\w+)"', src)
-        return m.group(1) if m else ""
+            "vps_worker.py"), "rb").read()
+        return hashlib.md5(data).hexdigest()[:10]
     except Exception:
         return ""
+
+
+async def _push_worker(st) -> str:
+    """SFTP the repo's CURRENT vps_worker.py to ~/vpsnode; returns
+    the worker's $HOME (the restart commands build on it). Shared
+    by the auto-update and the offline restart, so a dead worker
+    always comes back on the newest build in ONE shot."""
+    ssh = st["ssh"]
+    rc, out, _ = await ssh_exec(ssh, "echo $HOME", 20)
+    home = (out or "").strip() or "/root"
+    data = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "vps_worker.py"), "rb").read()
+    await ssh_put(ssh, data, f"{home}/{VPS_DIR}/vps_worker.py")
+    return home
 
 
 async def _worker_autoupdate(st):
@@ -736,12 +754,7 @@ async def _worker_autoupdate(st):
     ssh = st["ssh"]
     import autodl
     try:
-        rc, out, _ = await ssh_exec(ssh, "echo $HOME", 20)
-        home = (out or "").strip() or "/root"
-        data = open(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "vps_worker.py"), "rb").read()
-        await ssh_put(ssh, data, f"{home}/{VPS_DIR}/vps_worker.py")
+        home = await _push_worker(st)
         await ssh_exec(ssh, "pkill -f '[v]ps_worker.py' || true; "
                             "sleep 1", 30)
         rc, out, _ = await ssh_exec(
@@ -756,21 +769,22 @@ async def _worker_autoupdate(st):
                 ssh, f"sleep 3; kill -0 {pid} 2>/dev/null && echo ALIVE "
                      f"|| echo DEAD", 30)
             ok = "ALIVE" in (alive or "")
-        print(f"[vps] worker auto-update v{have}→v{want}:",
+        print(f"[vps] worker auto-update {have}→{want}:",
               "ok" if ok else "FAILED")
         if ok:
             await autodl._owner_dm(
-                f"♻️ <b>VPS worker auto-updated</b> v{have} → v{want} — "
-                f"restarted over SSH, beat should be back in ~90s. "
-                f"No action needed.")
+                f"♻️ <b>VPS worker auto-updated</b> — build "
+                f"<code>{have}</code> → <code>{want}</code>, restarted "
+                f"over SSH; beat back in ~90s. No action needed.")
         elif time.time() - (st.get("upd_warn") or 0) > 3600:
             v = dict(st)
             v["upd_warn"] = time.time()
             await store.set_config("vps", v)
             await autodl._owner_dm(
-                f"⚠️ <b>VPS worker update failed</b> (v{have} → v{want}) "
-                f"— it keeps running the OLD version (that's why jobs "
-                f"still fail there). Try /vps redeploy.")
+                f"⚠️ <b>VPS worker update failed</b> (build "
+                f"<code>{have}</code> → <code>{want}</code>) — it keeps "
+                f"running the OLD version (that's why jobs still fail "
+                f"there). Try /vps redeploy.")
     except Exception as exc:
         print("[vps] auto-update error:", repr(exc)[:120])
 
@@ -828,13 +842,16 @@ async def vps_watchdog_loop():
                 # OFF — per-batch 🖥 VPS picks still need it current
                 await _worker_autoupdate(st)
                 continue
-            if not st.get("enabled"):
-                continue
+            # OFFLINE: revive it EVEN WITH THE MODE OFF — per-batch
+            # 🖥 picks need a live worker — and push the CURRENT
+            # file first, so it comes back on the newest build in
+            # one shot instead of the stale one it died on
             rc, out, _ = await ssh_exec(st["ssh"],
                                         "pgrep -f '[v]ps_worker.py' "
                                         "|| true", 40)
             if out.strip():
-                continue
+                continue   # process alive but silent — network side
+            await _push_worker(st)
             rc, out, _ = await ssh_exec(
                 st["ssh"], "cd $HOME/vpsnode && rm -f worker.pid; "
                            "nohup python3 -u vps_worker.py "

@@ -17,6 +17,7 @@ disk filling up. Live progress is reported so the Koyeb /status
 panel shows the job exactly like a local one.
 """
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -30,8 +31,20 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 
-WORKER_BUILD = "5"   # bump on EVERY worker change — the watchdog
-#                    # auto-updates VPSes whose beat reports an older one
+def _self_build():
+    """Content-hash of THIS file, computed at boot. Koyeb hashes
+    its repo copy the same way, so ANY change to this file — even
+    one nobody remembered to stamp — auto-triggers the watchdog
+    update within ~5 minutes of the bot deploying. There is no
+    manual version to bump and nothing to forget."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()[:10]
+    except Exception:
+        return "0"
+
+
+WORKER_BUILD = _self_build()   # reported in every beat's caps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "vps_worker.json")
