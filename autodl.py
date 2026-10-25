@@ -989,6 +989,17 @@ async def run_job(group, item, ep, stream, db_ids, poster,
                 vps_sent = await _vps_archive(
                     job, series, ep, q, stream["url"], db_ids[0],
                     poster, force=(executor == "vps"))
+                if vps_sent is None and not job.get("cancel"):
+                    # worker failed (often a stale CDN url → 404):
+                    # refresh it and give the VPS ONE more try before
+                    # Koyeb takes the job over
+                    fresh = await refresh_stream_url(
+                        series, ep, q, stream["url"])
+                    if fresh and fresh != stream["url"]:
+                        stream["url"] = fresh
+                        vps_sent = await _vps_archive(
+                            job, series, ep, q, fresh, db_ids[0],
+                            poster, force=(executor == "vps"))
         job["via"] = "VPS" if vps_sent is not None else "Koyeb"
         if vps_sent is None:
             if job.get("cancel"):
@@ -1000,7 +1011,7 @@ async def run_job(group, item, ep, stream, db_ids, poster,
                 job["error"] = "disk low"
                 print("[autodl] disk low — skipping", fname)
                 return job
-            await download_stream(stream["url"], path, job)
+            await _download_fresh(stream, path, job, series, ep, q)
             size = os.path.getsize(path)
         else:
             size = getattr(getattr(vps_sent, "file", None),
@@ -1970,6 +1981,64 @@ async def _search_episode(section: str, series: str, ep):
         item.setdefault("section", section)
         return item
     return None
+
+
+async def refresh_stream_url(series, ep, quality, old_url=""):
+    """The API's CDN links expire (HTTP 404) while a long queue
+    works through its files. Re-query the search API and return the
+    CURRENT url for this exact series/ep/quality ('-eng' flavours
+    included), or None when the API no longer lists it."""
+    label = (quality or "").lower()
+    eng = _has_eng(label)
+    base = label.split("-")[0]
+    if base.isdigit():
+        base += "p"          # "360-eng" means "360p-eng"
+    sections = ("anime", "donghua") if eng else ("donghua", "anime")
+    for section in sections:
+        try:
+            item = await _search_episode(section, series, ep)
+        except Exception as exc:
+            print("[autodl] url-refresh search failed:",
+                  repr(exc)[:120])
+            continue
+        if not item:
+            continue
+        for s in item.get("streams", []):
+            q2 = (s.get("quality") or "").lower()
+            b2 = q2.split("-")[0]
+            if b2.isdigit():
+                b2 += "p"
+            if b2 != base or eng != _has_eng(q2):
+                continue
+            url = s.get("url") or ""
+            if url:
+                if url != old_url:
+                    print(f"[autodl] refreshed {quality} url for "
+                          f"{series} Ep {ep}")
+                return url
+    return None
+
+
+async def _download_fresh(stream, path, job, series, ep, q):
+    """download_stream + ONE url refresh when the CDN answers
+    403/404 (stale link) — then retry with the fresh url."""
+    try:
+        await download_stream(stream["url"], path, job)
+        return
+    except RuntimeError as rex:
+        if "404" not in str(rex) and "403" not in str(rex):
+            raise
+        fresh = await refresh_stream_url(series, ep, q, stream["url"])
+        if not fresh:
+            raise
+        print(f"[autodl] HTTP 403/404 → fresh url for {series} "
+              f"Ep {ep} [{q}] — retrying download")
+        stream["url"] = fresh
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        await download_stream(fresh, path, job)
 
 
 async def _eng_pending_pass(st) -> int:
