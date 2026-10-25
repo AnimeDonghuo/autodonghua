@@ -453,7 +453,7 @@ async def _provision(chat_id, msg):
         await ssh_exec(cfg, f"chmod 600 {home}/{VPS_DIR}/"
                             "vps_worker.json", 20)
         cron = (f"@reboot cd {home}/{VPS_DIR} && nohup python3 -u "
-                f"vps_worker.py >> worker.log 2>&1 &")
+                f"vps_worker.py >> worker.log 2>&1 </dev/null &")
         await ssh_exec(cfg, f"(crontab -l 2>/dev/null | grep -v "
                             f"vps_worker.py; echo '{cron}') | crontab -",
                        30)
@@ -481,10 +481,34 @@ async def _provision(chat_id, msg):
                 f"it must be THIS bot's service url, like "
                 f"https://your-app.koyeb.app. Fix it with /addvps or "
                 f"/vps redeploy.")
-        await ssh_exec(cfg, f"pkill -f '[v]ps_worker.py'; sleep 1; "
-                            f"cd {home}/{VPS_DIR} && nohup python3 -u "
-                            f"vps_worker.py >> worker.log 2>&1 & "
-                            f"sleep 2; pgrep -f '[v]ps_worker.py'", 60)
+        # 1) kill any old worker — MUST be its own SSH call: inside a
+        #    compound command the shell's own cmdline contains the
+        #    literal 'vps_worker.py' (the nohup part) and pkill -f
+        #    would kill the shell before the worker ever starts
+        await ssh_exec(cfg, "pkill -f '[v]ps_worker.py' || true; "
+                            "sleep 1", 30)
+        # 2) start the new one — pidfile pattern: stdout/stderr to the
+        #    log, stdin from /dev/null, pid into worker.pid (a plain
+        #    '& echo $!' capture keeps the SSH channel/pipe open and
+        #    HANGS the call forever — verified locally)
+        rc, out, _ = await ssh_exec(
+            cfg, f"cd {home}/{VPS_DIR} && rm -f worker.pid; nohup "
+                 f"python3 -u vps_worker.py >> worker.log 2>&1 "
+                 f"</dev/null & echo $! > {home}/{VPS_DIR}/worker.pid; "
+                 f"cat {home}/{VPS_DIR}/worker.pid", 30)
+        pid = (out or "").strip().splitlines()[-1].strip() if out else ""
+        # 3) honest liveness check — this shell has NO literal in it
+        await asyncio.sleep(2)
+        rc, out, _ = await ssh_exec(cfg, "pgrep -f '[v]ps_worker.py' "
+                                         "|| echo NONE", 30)
+        if "NONE" in (out or "") or not (out or "").strip():
+            rc, lg, _ = await ssh_exec(
+                cfg, f"tail -5 {home}/{VPS_DIR}/worker.log 2>/dev/null",
+                30)
+            raise RuntimeError(
+                "worker process did not stay alive (pid "
+                + (pid or "?") + ") — log: "
+                + ((lg or "").strip()[-200:] or "(empty)"))
         if msg:
             await flood_edit(msg, "💓 Waiting for worker heartbeat…",
                              parse_mode="html")
@@ -618,9 +642,11 @@ async def cmd_vps(e):
                                  + "</code>")
                 if "STOPPED" in (out or ""):
                     await ssh_exec(
-                        ssh, f"cd ~/{VPS_DIR} && nohup python3 -u "
-                             f"vps_worker.py >> worker.log 2>&1 & "
-                             f"echo $!", 30)
+                        ssh, f"cd ~/{VPS_DIR} && rm -f worker.pid; "
+                             f"nohup python3 -u vps_worker.py "
+                             f">> worker.log 2>&1 </dev/null & echo $! "
+                             f"> ~/{VPS_DIR}/worker.pid; "
+                             f"cat ~/{VPS_DIR}/worker.pid", 30)
                     lines.append("↻ Restarted it — /vps check again "
                                  "in ~1 min.")
             except Exception as ex:
@@ -683,11 +709,20 @@ async def vps_watchdog_loop():
             if out.strip():
                 continue
             rc, out, _ = await ssh_exec(
-                st["ssh"], "cd $HOME/vpsnode && nohup python3 -u "
-                           "vps_worker.py >> worker.log 2>&1 & "
-                           "sleep 2; pgrep -f '[v]ps_worker.py'", 60)
-            print("[vps] watchdog restart:", out.strip()[:40] or "failed")
-            if not out.strip():
+                st["ssh"], "cd $HOME/vpsnode && rm -f worker.pid; "
+                           "nohup python3 -u vps_worker.py "
+                           ">> worker.log 2>&1 </dev/null & echo $! "
+                           "> $HOME/vpsnode/worker.pid; "
+                           "cat $HOME/vpsnode/worker.pid", 60)
+            pid = (out or "").strip().splitlines()[-1].strip() if out else ""
+            alive = ""
+            if pid.isdigit():
+                _, alive, _ = await ssh_exec(
+                    st["ssh"], f"sleep 3; kill -0 {pid} 2>/dev/null && "
+                               f"echo ALIVE || echo DEAD", 30)
+            print("[vps] watchdog restart pid:", pid[:12] or "none",
+                  (alive or "").strip() or "?")
+            if "ALIVE" not in (alive or ""):
                 if time.time() - (st.get("wd_warn") or 0) > 3600:
                     v = dict(st)
                     v["wd_warn"] = time.time()
