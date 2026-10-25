@@ -682,7 +682,8 @@ async def cmd_vps(e):
         f"runs Koyeb + VPS at the same time",
         f"Caps: py {caps.get('py', '?')} · telethon {yes('telethon')} "
         f"· Pillow {yes('PIL')} · hachoir {yes('hachoir')} · disk "
-        f"{caps.get('disk_mb', '?')} MB",
+        f"{caps.get('disk_mb', '?')} MB · worker v"
+        f"{caps.get('build', '?')}",
         f"Done: <b>{st.get('jobs') or 0}</b> job(s) · "
         f"<b>{round((st.get('bytes') or 0) / 1073741824, 2)} GB</b> "
         f"uploaded · avg {st.get('speed') or 0} MB/s",
@@ -696,16 +697,86 @@ async def cmd_vps(e):
     await flood_respond(e, "\n".join(lines), parse_mode="html")
 
 
+def _worker_build() -> str:
+    """The build stamp of the vps_worker.py sitting next to this file
+    (the one /vps redeploy + the watchdog ship to the VPS)."""
+    import re as _re
+    try:
+        src = open(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "vps_worker.py"), encoding="utf-8").read()
+        m = _re.search(r'WORKER_BUILD\s*=\s*"(\w+)"', src)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+async def _worker_autoupdate(st):
+    """Every beat carries the worker's build stamp. When the bot's
+    copy is newer, re-upload it and restart the worker over SSH —
+    nobody has to remember /vps redeploy after a bot update."""
+    want = _worker_build()
+    have = str((st.get("caps") or {}).get("build") or "0")
+    if not want or have == want:
+        return
+    ssh = st["ssh"]
+    import autodl
+    try:
+        rc, out, _ = await ssh_exec(ssh, "echo $HOME", 20)
+        home = (out or "").strip() or "/root"
+        data = open(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "vps_worker.py"), "rb").read()
+        await ssh_put(ssh, data, f"{home}/{VPS_DIR}/vps_worker.py")
+        await ssh_exec(ssh, "pkill -f '[v]ps_worker.py' || true; "
+                            "sleep 1", 30)
+        rc, out, _ = await ssh_exec(
+            ssh, f"cd {home}/{VPS_DIR} && rm -f worker.pid; nohup "
+                 f"python3 -u vps_worker.py >> worker.log 2>&1 "
+                 f"</dev/null & echo $! > {home}/{VPS_DIR}/worker.pid; "
+                 f"cat {home}/{VPS_DIR}/worker.pid", 30)
+        pid = (out or "").strip().splitlines()[-1].strip() if out else ""
+        ok = pid.isdigit()
+        if ok:
+            _, alive, _ = await ssh_exec(
+                ssh, f"sleep 3; kill -0 {pid} 2>/dev/null && echo ALIVE "
+                     f"|| echo DEAD", 30)
+            ok = "ALIVE" in (alive or "")
+        print(f"[vps] worker auto-update v{have}→v{want}:",
+              "ok" if ok else "FAILED")
+        if ok:
+            await autodl._owner_dm(
+                f"♻️ <b>VPS worker auto-updated</b> v{have} → v{want} — "
+                f"restarted over SSH, beat should be back in ~90s. "
+                f"No action needed.")
+        elif time.time() - (st.get("upd_warn") or 0) > 3600:
+            v = dict(st)
+            v["upd_warn"] = time.time()
+            await store.set_config("vps", v)
+            await autodl._owner_dm(
+                f"⚠️ <b>VPS worker update failed</b> (v{have} → v{want}) "
+                f"— it keeps running the OLD version (that's why jobs "
+                f"still fail there). Try /vps redeploy.")
+    except Exception as exc:
+        print("[vps] auto-update error:", repr(exc)[:120])
+
+
 async def vps_watchdog_loop():
-    """Every 5 min: if the mode is ON but the worker went silent and
-    we have SSH creds, restart it on the VPS; tell the owner if even
-    that fails (once per hour)."""
+    """Every 5 min: if the mode is ON and the worker went silent,
+    restart it on the VPS; if it is online but OUTDATED, auto-update
+    it; tell the owner when even that fails (once per hour)."""
     while True:
         await asyncio.sleep(300)
         try:
             st = await vps_state()
-            if not (st.get("enabled") and st.get("ssh")) \
-                    or st.get("online"):
+            if not st.get("ssh"):
+                continue
+            if st.get("online"):
+                # outdated worker? refresh it even while the mode is
+                # OFF — per-batch 🖥 VPS picks still need it current
+                await _worker_autoupdate(st)
+                continue
+            if not st.get("enabled"):
                 continue
             rc, out, _ = await ssh_exec(st["ssh"],
                                         "pgrep -f '[v]ps_worker.py' "

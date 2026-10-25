@@ -25,6 +25,9 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
 
+WORKER_BUILD = "3"   # bump on EVERY worker change — the watchdog
+#                    # auto-updates VPSes whose beat reports an older one
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "vps_worker.json")
 DL = os.path.join(HERE, "dl")
@@ -50,7 +53,7 @@ def api(path, payload=None, timeout=40):
 
 
 def caps():
-    c = {"py": sys.version.split()[0]}
+    c = {"py": sys.version.split()[0], "build": WORKER_BUILD}
     for mod in ("telethon", "PIL", "hachoir"):
         try:
             __import__(mod)

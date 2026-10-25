@@ -361,6 +361,10 @@ def job_panel(job=None) -> str:
     """The owner-DM progress card (ytdown style)."""
     cpu, ram, total = container_stats()
     lines = ["📋 <b>Your downloads</b>", ""]
+    # lane 1 may already be finished while lane 2 still works —
+    # promote it so the panel never says "starting…" over a live job
+    if job is None:
+        job = CURRENT or CURRENT2
     if job is None:
         lines.append(f"⏳ {BATCH['total']} file(s) queued — "
                      f"starting…")
@@ -401,7 +405,7 @@ def job_panel(job=None) -> str:
                          f"· ⏳ ETA {eta}s")
         lines.append("")
         lines.append(f"🆔 {job['id']} · /cancel_{job['id']}")
-    j2 = CURRENT2 if job is not CURRENT2 else None
+    j2 = CURRENT2 if job is not CURRENT2 else CURRENT
     if j2 is not None:
         pct2 = ((j2["up_done"] / j2["up_total"] * 100)
                 if j2["phase"] == "upload" and j2["up_total"] else
@@ -419,7 +423,8 @@ def job_panel(job=None) -> str:
     lines.append(f"📊 Container CPU: {cpu:.0f}% of quota · "
                  f"RAM: {ram:.1f} MiB / {total:.1f} MiB")
     queued = max(0, BATCH["total"] - BATCH["n"])
-    active = 1 if job and job["status"] == "running" else 0
+    active = sum(1 for j in (CURRENT, CURRENT2)
+                 if j is not None and j.get("status") == "running")
     lines.append(f"Active/queued: {active} / {queued} · "
                  f"/cancel_&lt;id&gt; stops one · /cancelall stops all")
     return "\n".join(lines)
