@@ -566,13 +566,34 @@ def http_session(total=900):
     return _HTTP, aiohttp.ClientTimeout(total=total)
 
 
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
+
+
 async def download_stream(url: str, dest: str, job=None) -> str:
     """Download with HTTP-range RESUME: a restart mid-file picks up
-    from the bytes already on disk instead of starting over."""
+    from the bytes already on disk instead of starting over.
+
+    Sent with real browser headers — episode CDNs answer a bare
+    python/aiohttp User-Agent with 403 Forbidden — and a 403 is
+    retried once with a Referer before giving up."""
     have = os.path.getsize(dest) if os.path.exists(dest) else 0
-    headers = {"Range": f"bytes={have}-"} if have else {}
     s, timeout = http_session(900)
-    async with s.get(url, headers=headers, timeout=timeout) as r:
+    loop = asyncio.get_running_loop()
+    last_status = 0
+    for extra in ({}, {"Referer": "https://api.parciv.workers.dev/"}):
+        headers = {"User-Agent": BROWSER_UA, "Accept": "*/*",
+                   "Accept-Language": "en-US,en;q=0.9"}
+        headers.update(extra)
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        async with s.get(url, headers=headers, timeout=timeout) as r:
+            last_status = r.status
+            if r.status in (401, 403, 451):
+                print(f"[autodl] download HTTP {r.status} — retrying "
+                      f"with referer headers: {url[:90]}")
+                continue
             if r.status == 206 and have:  # partial content: append
                 mode = "ab"
                 rng = r.headers.get("Content-Range", "")
@@ -588,7 +609,6 @@ async def download_stream(url: str, dest: str, job=None) -> str:
                 job["total"] = total
             last = time.time()
             last_done = done
-            loop = asyncio.get_running_loop()
             with open(dest, mode) as f:
                 async for chunk in r.content.iter_chunked(1 << 20):
                     if job is not None and job["cancel"]:
@@ -604,7 +624,9 @@ async def download_stream(url: str, dest: str, job=None) -> str:
                             job["speed"] = ((done - last_done)
                                             / (now - last))
                             last, last_done = now, done
-    return dest
+            return dest
+    raise RuntimeError(f"HTTP {last_status} (CDN blocked both header "
+                       f"flavours)")
 
 
 async def resolve_poster(item, series: str):

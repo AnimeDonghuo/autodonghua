@@ -17,7 +17,13 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
+
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0.0.0 Safari/537.36")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(HERE, "vps_worker.json")
@@ -75,11 +81,32 @@ def progress(job_id, phase, done, total):
         pass
 
 
+def _dl_request(url, referer=False):
+    """Browser headers — episode CDNs answer the bare
+    Python-urllib User-Agent with 403 Forbidden."""
+    h = {"User-Agent": BROWSER_UA, "Accept": "*/*",
+         "Accept-Language": "en-US,en;q=0.9"}
+    if referer:
+        h["Referer"] = "https://api.parciv.workers.dev/"
+    return urllib.request.Request(url, headers=h)
+
+
 def download(url, path, job_id):
     t0 = time.time()
     done = 0
-    with urllib.request.urlopen(url, timeout=120) as r, \
-            open(path, "wb") as fh:
+    r = None
+    for referer in (False, True):   # 403 → retry once with a referer
+        try:
+            r = urllib.request.urlopen(_dl_request(url, referer),
+                                       timeout=120)
+            break
+        except urllib.error.HTTPError as ex:
+            if ex.code in (401, 403, 451) and not referer:
+                log("download HTTP", ex.code, "— retrying with "
+                    "referer headers")
+                continue
+            raise
+    with r, open(path, "wb") as fh:
         total = int(r.headers.get("Content-Length") or 0)
         while True:
             chunk = r.read(1 << 20)
