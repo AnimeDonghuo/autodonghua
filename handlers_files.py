@@ -34,11 +34,16 @@ def _fast_filename(fname: str):
     """'Jie Men Zhi Xia Eps 20 [720p].mp4' -> ('Jie Men Zhi Xia', 20,
     '720p'). '[Video]' / '[Video (2)]' / ... are the eng flavours
     (360p/720p/1080p/480p-eng) — no mediainfo scan needed at all."""
-    m = re.match(r"^(?P<series>.+?)\s+Eps\s+(?P<ep>\d{1,4})\s+"
-                 r"\[(?P<tag>[^\]]+)\](?:\.\w+)?$", fname.strip())
+    m = re.match(
+        r"^(?P<series>.+?)\s+Ep(?:isode)?s?\s+(?P<ep>\d{1,4})"
+        r"(?:\s+\[(?P<tag>[^\]]+)\]|\s+(?P<tag2>\d{3,4}p(?:-eng)?))?"
+        r"(?:\.\w+)?$",
+        fname.strip(), re.IGNORECASE)
     if not m:
         return None
-    tag = m.group("tag").strip().lower()
+    tag = (m.group("tag") or m.group("tag2") or "").strip().lower()
+    if not tag:          # name+ep only — caller may ask the quality
+        return m.group("series").strip(), int(m.group("ep")), None
     if re.fullmatch(r"\d{3,4}p", tag):
         q = tag
     elif tag in FAST_ENG:
@@ -491,10 +496,11 @@ async def cb_busy_fast(e):
     """⚡ Fast ingest from the busy notice: ask for the name, then run
     the instant caption-named path on the ORIGINAL file — no LOAD."""
     from core import wait_for
-    orig = _BUSY.pop(e.message_id, None)
-    if orig is None or orig.sender_id != e.sender_id:
+    st = _BUSY.pop(e.message_id, None)
+    if st is None or st["orig"].sender_id != e.sender_id:
         return await e.answer("Menu expired — send the file again",
                               alert=True)
+    orig = st["orig"]
     await e.answer()
     await flood_edit(e, "⚡ <b>Fast ingest</b> — reply with the name:\n"
                         "<code>Series Eps NN [quality]</code>\n"
@@ -517,11 +523,50 @@ async def cb_busy_fast(e):
             orig, "❌ That doesn't look like <code>Series Eps NN "
                   "[quality]</code> — send the file again.",
             parse_mode="html")
+    if not fast[2]:      # no quality in the answer → button menu
+        m = await flood_respond(
+            orig, f"⚡ <b>{escape_html(fast[0])} Eps {fast[1]}</b> — "
+                  f"which quality is it?", parse_mode="html",
+            buttons=[[Button.inline("360p", b"fbq:360p"),
+                      Button.inline("480p", b"fbq:480p"),
+                      Button.inline("720p", b"fbq:720p"),
+                      Button.inline("1080p", b"fbq:1080p")],
+                     [Button.inline("360p-eng", b"fbq:360p-eng"),
+                      Button.inline("480p-eng", b"fbq:480p-eng"),
+                      Button.inline("720p-eng", b"fbq:720p-eng"),
+                      Button.inline("1080p-eng", b"fbq:1080p-eng")],
+                     [Button.inline("🐢 Wait & resend", b"fbwait")]])
+        if m is not None:
+            _BUSY[m.id] = {"orig": orig, "series": fast[0],
+                           "ep": fast[1], "fname": name}
+        return
     media_obj = orig.video or orig.document
     if media_obj is None:
         return await flood_respond(orig, "❌ Original file expired — "
                                          "send it again.")
     await _fast_ingest(orig, name, fast[0], fast[1], fast[2], media_obj)
+
+
+@app.on(events.CallbackQuery(pattern=rb"fbq:([\w\-]+)"))
+async def cb_busy_quality(e):
+    """Quality tap after the description gave series+ep — instant
+    ingest of the ORIGINAL file with the chosen quality."""
+    st = _BUSY.pop(e.message_id, None)
+    if (st is None or "series" not in st
+            or st["orig"].sender_id != e.sender_id):
+        return await e.answer("Menu expired — send the file again",
+                              alert=True)
+    await e.answer()
+    orig = st["orig"]
+    media_obj = orig.video or orig.document
+    if media_obj is None:
+        return await flood_respond(orig, "❌ Original file expired — "
+                                         "send it again.")
+    q = e.pattern_match.group(1).decode()
+    # archive under the canonical name so the file name always says
+    # series + ep + quality (matches every other fast ingest)
+    await _fast_ingest(orig, f"{st['series']} Eps {st['ep']} [{q}]",
+                       st["series"], st["ep"], q, media_obj)
 
 
 @app.on(events.CallbackQuery(pattern=rb"fbwait"))
@@ -552,16 +597,40 @@ async def on_file(e):
         return  # ignore non-media documents in the auto flow
 
     fname = _file_name(e)
-    fast = _fast_filename(fname)
-    if not fast:  # the description may live in the caption instead
-        cap = _caption_name(e)
-        if cap and cap != fname:
-            got = _fast_filename(cap)
-            if got:
-                fname, fast = cap, got
-    if fast:  # description carries series/ep/quality: instant path,
+    cap = _caption_name(e)
+    # the DESCRIPTION is the fast lane: users caption the file instead
+    # of renaming it, so the caption is tried FIRST
+    fast = _fast_filename(cap) if cap else None
+    if fast:
+        fname = cap
+    else:
+        fast = _fast_filename(fname)
+    if fast and fast[2]:  # series+ep+quality known: instant path,
         await _fast_ingest(e, fname, fast[0], fast[1], fast[2],
                            media_obj)   # never waits on LOAD
+        return
+
+    if LOAD.locked() and fast:
+        # the description gave series+ep but no quality — one tap away
+        m = await flood_respond(
+            e, f"⚡ I read <b>{escape_html(fast[0])} Eps {fast[1]}</b> "
+               f"from your file — which quality is it?\n\n"
+               f"<i>(pick one — instant ingest, no waiting)</i>",
+            parse_mode="html",
+            buttons=[[Button.inline("360p", b"fbq:360p"),
+                      Button.inline("480p", b"fbq:480p"),
+                      Button.inline("720p", b"fbq:720p"),
+                      Button.inline("1080p", b"fbq:1080p")],
+                     [Button.inline("360p-eng", b"fbq:360p-eng"),
+                      Button.inline("480p-eng", b"fbq:480p-eng"),
+                      Button.inline("720p-eng", b"fbq:720p-eng"),
+                      Button.inline("1080p-eng", b"fbq:1080p-eng")],
+                     [Button.inline("🐢 Wait & resend", b"fbwait")]])
+        if m is not None:
+            if len(_BUSY) > 32:
+                _BUSY.pop(next(iter(_BUSY)), None)
+            _BUSY[m.id] = {"orig": e, "series": fast[0], "ep": fast[1],
+                           "fname": fname}
         return
 
     if LOAD.locked():
@@ -569,8 +638,8 @@ async def on_file(e):
             "⏳ <b>One file is being processed right now</b> — "
             "pick how to handle THIS one:\n\n"
             "⚡ <b>Fast ingest</b> — give me its name "
-            "(<code>Series Eps NN [quality]</code>) and I ingest it "
-            "instantly, no waiting.\n"
+            "(<code>Series Eps NN [quality]</code> — quality optional, "
+            "I'll ask) and I ingest it instantly, no waiting.\n"
             "🐢 <b>Slow path</b> — wait a bit and send it again for "
             "the full mediainfo scan.\n\n"
             "<i>(free-tier instances process one file at a time)</i>",
@@ -580,7 +649,7 @@ async def on_file(e):
         if m is not None:
             if len(_BUSY) > 32:
                 _BUSY.pop(next(iter(_BUSY)), None)
-            _BUSY[m.id] = e
+            _BUSY[m.id] = {"orig": e}
         return
 
     path = None
