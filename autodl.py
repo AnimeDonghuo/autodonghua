@@ -357,6 +357,38 @@ def _hs(num) -> str:
     return human_size(int(num)) or "0 B"
 
 
+PANEL_BUTTONS = [[Button.inline("🔄 Refresh", b"jrefresh"),
+                  Button.inline("🛑 Cancel ALL", b"jcancelall")]]
+
+
+def _job_card(job):
+    """The progress body (bar + ⬆/⬇ + phase line) — rendered
+    IDENTICALLY for both parallel lanes."""
+    lines = []
+    if job["phase"] == "upload":
+        pct = (job["up_done"] / job["up_total"] * 100
+               if job["up_total"] else 0.0)
+        lines.append(f"{_bar(pct)}  {pct:.1f}%")
+        lines.append(f"⬆ Telegram: {_hs(job['up_done'])}"
+                     f" / {_hs(job['up_total'])}")
+        lines.append(f"⬇ Source: {_hs(job['done'])}")
+        lines.append("📌 Uploading to Telegram…")
+    else:
+        pct = (job["done"] / job["total"] * 100
+               if job["total"] else 0.0)
+        lines.append(f"{_bar(pct)}  {pct:.1f}%")
+        lines.append(f"⬆ Telegram: {_hs(job['up_done'])}"
+                     f" / {_hs(job['up_total'])}")
+        lines.append(f"⬇ Source: {_hs(job['done'])}"
+                     + (f" / {_hs(job['total'])}"
+                        if job["total"] else ""))
+        eta = (int((job["total"] - job["done"]) / job["speed"])
+               if job["speed"] > 0 and job["total"] else 0)
+        lines.append(f"🚀 {human_size(int(job['speed']))}/s "
+                     f"· ⏳ ETA {eta}s")
+    return lines
+
+
 def job_panel(job=None) -> str:
     """The owner-DM progress card (ytdown style)."""
     cpu, ram, total = container_stats()
@@ -382,43 +414,22 @@ def job_panel(job=None) -> str:
                         if job.get("via") == "VPS"
                         else "<b>☁️ Koyeb</b>"))
         lines.append("")
-        if job["phase"] == "upload":
-            pct = (job["up_done"] / job["up_total"] * 100
-                   if job["up_total"] else 0.0)
-            lines.append(f"{_bar(pct)}  {pct:.1f}%")
-            lines.append(f"⬆ Telegram: {_hs(job['up_done'])}"
-                         f" / {_hs(job['up_total'])}")
-            lines.append(f"⬇ Source: {_hs(job['done'])}")
-            lines.append("📌 Uploading to Telegram…")
-        else:
-            pct = (job["done"] / job["total"] * 100
-                   if job["total"] else 0.0)
-            lines.append(f"{_bar(pct)}  {pct:.1f}%")
-            lines.append(f"⬆ Telegram: {_hs(job['up_done'])}"
-                         f" / {_hs(job['up_total'])}")
-            lines.append(f"⬇ Source: {_hs(job['done'])}"
-                         + (f" / {_hs(job['total'])}"
-                            if job["total"] else ""))
-            eta = (int((job["total"] - job["done"]) / job["speed"])
-                   if job["speed"] > 0 and job["total"] else 0)
-            lines.append(f"🚀 {human_size(int(job['speed']))}/s "
-                         f"· ⏳ ETA {eta}s")
+        lines += _job_card(job)
         lines.append("")
         lines.append(f"🆔 {job['id']} · /cancel_{job['id']}")
     j2 = CURRENT2 if job is not CURRENT2 else CURRENT
-    if j2 is not None:
-        pct2 = ((j2["up_done"] / j2["up_total"] * 100)
-                if j2["phase"] == "upload" and j2["up_total"] else
-                ((j2["done"] / j2["total"] * 100)
-                 if j2["total"] else 0.0))
-        arrow = "⬆" if j2["phase"] == "upload" else "⬇"
+    if j2 is not None and j2 is not job:
         lines.append("")
-        lines.append(f"🎬 2nd lane: {escape_html(j2['title'])} "
+        lines.append(f"🎬 <b>2nd lane</b>: {escape_html(j2['title'])} "
                      f"Eps {j2['ep']} [{j2['quality']}]")
-        lines.append(f"{arrow} {_bar(pct2)} {pct2:.0f}% · 🛰 "
-                     + ("🖥 VPS" if j2.get("via") == "VPS"
-                        else "☁️ Koyeb")
-                     + f" · /cancel_{j2['id']}")
+        lines.append("🛰 Running on: "
+                     + ("<b>🖥 VPS worker</b>"
+                        if j2.get("via") == "VPS"
+                        else "<b>☁️ Koyeb</b>"))
+        lines.append("")
+        lines += _job_card(j2)
+        lines.append("")
+        lines.append(f"🆔 {j2['id']} · /cancel_{j2['id']}")
     lines.append("")
     lines.append(f"📊 Container CPU: {cpu:.0f}% of quota · "
                  f"RAM: {ram:.1f} MiB / {total:.1f} MiB")
@@ -471,7 +482,7 @@ async def _resolve_owner():
     return None
 
 
-async def _owner_dm(text: str):
+async def _owner_dm(text: str, buttons=None):
     ent = await _resolve_owner()
     if ent is None:
         print("[autodl] owner DM skipped — no owner/admin known "
@@ -489,7 +500,8 @@ async def _owner_dm(text: str):
         asyncio.ensure_future(_delayed_owner_dm(oid, text, left + 5))
         return None
     try:
-        return await app.send_message(ent, text, parse_mode="html")
+        return await app.send_message(ent, text, parse_mode="html",
+                                      buttons=buttons)
     except FloodWaitError as fw:
         core_mod.flood_mark(oid, fw.seconds)
         asyncio.ensure_future(_delayed_owner_dm(oid, text,
@@ -544,7 +556,8 @@ async def panel_loop():
                 if text != last:
                     try:
                         await app.edit_message(chat, mid, text,
-                                               parse_mode="html")
+                                               parse_mode="html",
+                                               buttons=PANEL_BUTTONS)
                         last = text
                     except FloodWaitError as fw:
                         core_mod.flood_mark(chat, fw.seconds)
@@ -1193,19 +1206,53 @@ async def run_batch(fresh, force=False, executor="auto"):
     BATCH["total"] = sum(len(todo)
                          for g in groups
                          for _, todo, _ in g["entries"])
-    msg = await _owner_dm(job_panel(None))
+    msg = await _owner_dm(job_panel(None), buttons=PANEL_BUTTONS)
     if msg is not None:
         await set_live_panel(getattr(msg, "chat_id", None),
                              getattr(msg, "id", None))
     done = 0
+    par = False
+    if executor == "auto" and await _parallel_on():
+        _st = await core_mod.vps_state()
+        par = bool(_st.get("online"))
     try:
-        for g in groups:
-            if BATCH.get("stop"):
-                print("[autodl] cancel-all — batch stopped")
-                break
-            if await process_group(g, force=force,
-                                   executor=executor):
-                done += 1
+        if par:
+            # 🔀 PARALLEL — two fully independent lanes: each lane
+            # OWNS whole animes (or, for a single-anime batch, whole
+            # episodes) and runs every quality of them itself.
+            # Whoever finishes first starts its next one instantly —
+            # no lane ever waits for the other.
+            if len(groups) == 1 and len(groups[0]["entries"]) >= 2:
+                _g = groups[0]
+                _ents = _g["entries"]
+                lane_groups = [dict(_g, entries=_ents[0::2]),
+                               dict(_g, entries=_ents[1::2])]
+            else:
+                lane_groups = groups
+            lane_a = lane_groups[0::2]
+            lane_b = lane_groups[1::2]
+
+            async def _lane(gs, ex):
+                d = 0
+                for g in gs:
+                    if BATCH.get("stop"):
+                        print("[autodl] cancel-all — lane stopped")
+                        break
+                    if await process_group(g, force=force,
+                                           executor=ex):
+                        d += 1
+                return d
+            ra, rb = await asyncio.gather(_lane(lane_a, "koyeb"),
+                                          _lane(lane_b, "vps"))
+            done += ra + rb
+        else:
+            for g in groups:
+                if BATCH.get("stop"):
+                    print("[autodl] cancel-all — batch stopped")
+                    break
+                if await process_group(g, force=force,
+                                       executor=executor):
+                    done += 1
     finally:
         ok = sum(1 for j in JOBS.values() if j["status"] == "done")
         bad = sum(1 for j in JOBS.values() if j["status"] == "failed")
@@ -1226,7 +1273,9 @@ async def run_batch(fresh, force=False, executor="auto"):
                     + "\n"
                     f"📊 Container CPU: {cpu:.0f}% of quota · "
                     f"RAM: {ram:.1f} MiB / {total:.1f} MiB",
-                    parse_mode="html")
+                    parse_mode="html",
+                    buttons=[[Button.inline("🔄 Refresh",
+                                            b"jrefresh")]])
             except Exception:
                 pass
             PANEL["chat"] = PANEL["id"] = None  # freeze the summary
@@ -1877,36 +1926,11 @@ async def process_group(group, force=False, executor="auto") -> bool:
                     norm, ep, stream["quality"]):
                 continue  # another batch already archived this file
             pend.append(stream)
-        par = False
-        if pend and await _parallel_on():
-            _st = await core_mod.vps_state()
-            par = bool(_st.get("online"))
-        if par:
-            # 🔀 two lanes at once: even files on Koyeb, odd on the
-            # VPS — different bots, so separate Telegram rate limits
-            lane_k = pend[0::2]
-            lane_v = pend[1::2]
-            idx = 0
-            while idx < max(len(lane_k), len(lane_v)):
-                if BATCH.get("stop"):
-                    break
-                tasks = []
-                if idx < len(lane_k):
-                    tasks.append(_run_stream(group, item, ep,
-                                             lane_k[idx], db_ids,
-                                             poster, "koyeb"))
-                if idx < len(lane_v):
-                    tasks.append(_run_stream(group, item, ep,
-                                             lane_v[idx], db_ids,
-                                             poster, "vps"))
-                await asyncio.gather(*tasks)
-                idx += 1
-        else:
-            for stream in pend:
-                if BATCH.get("stop"):
-                    break
-                await _run_stream(group, item, ep, stream, db_ids,
-                                  poster, executor)
+        for stream in pend:
+            if BATCH.get("stop"):
+                break
+            await _run_stream(group, item, ep, stream, db_ids,
+                              poster, executor)
 
         links = {}
         deeps = {}

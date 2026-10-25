@@ -3,6 +3,7 @@ AutoDL commands: /autodl, /checknew + quality-button callbacks.
 """
 import asyncio
 import re
+import time
 
 from telethon import events
 from telethon.tl.custom import Button
@@ -312,18 +313,43 @@ async def cmd_parallel(e):
                         parse_mode="html")
 
 
+async def _status_head():
+    """Shared /status header: the AutoDL block PLUS the VPS worker's
+    own stats whenever one is registered — Koyeb side unchanged."""
+    st = await autodl.get_settings()
+    qs = st.get("qualities") or []
+    head = (f"🤖 <b>AutoDL:</b> {'🟢 on' if st.get('enabled') else '🔴 off'}"
+            f" · every {st.get('interval', 20)} min\n"
+            f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
+            f"{autodl.telethon_info()} · build {autodl.BUILD}\n")
+    v = await vps_state()
+    if v.get("secret"):
+        caps = v.get("caps") or {}
+        ssh = v.get("ssh") or {}
+        gb = (v.get("bytes") or 0) / 1073741824
+        head += (
+            "\n🖥 <b>VPS worker:</b> "
+            + ("🟢 online" if v.get("online") else "🔴 OFFLINE")
+            + (f" (beat {int(time.time() - v['beat'])}s ago)"
+               if v.get("beat") else "")
+            + f" · mode {'ON' if v.get('enabled') else 'off'}\n"
+            f"🖥 py {caps.get('py', '?')} · worker v"
+            f"{caps.get('build', '?')} · disk "
+            f"{caps.get('disk_mb', '?')} MB free · "
+            f"{ssh.get('user', 'root')}@{ssh.get('host', '?')}\n"
+            f"🖥 done {v.get('jobs', 0)} job(s) · {gb:.2f} GB "
+            f"uploaded · avg {v.get('speed', 0):.1f} MB/s\n"
+            f"🔀 Parallel: <b>{'ON' if await store.get_config('parallel', False) else 'off'}</b>\n")
+    return head + "\n"
+
+
 @app.on(events.NewMessage(pattern=r"^/status$"))
 async def cmd_status(e):
     """Live AutoDL/transfer status — works for staff anywhere."""
     if not await require_staff(e):
         return
     from telethon import Button
-    st = await autodl.get_settings()
-    qs = st.get("qualities") or []
-    head = (f"🤖 <b>AutoDL:</b> {'🟢 on' if st.get('enabled') else '🔴 off'}"
-            f" · every {st.get('interval', 20)} min\n"
-            f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
-            f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
+    head = await _status_head()
     m = await flood_respond(e, head + autodl.job_panel(autodl.CURRENT),
                             parse_mode="html",
                             buttons=[[Button.inline("🔄 Refresh",
@@ -339,12 +365,7 @@ async def cmd_status(e):
 async def cb_jrefresh(e):
     if not await require_staff(e):
         return
-    st = await autodl.get_settings()
-    qs = st.get("qualities") or []
-    head = (f"🤖 <b>AutoDL:</b> {'🟢 on' if st.get('enabled') else '🔴 off'}"
-            f" · every {st.get('interval', 20)} min\n"
-            f"🎞 Qualities: {'ALL the API offers' if not qs else ', '.join(qs)}\n"
-            f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
+    head = await _status_head()
     try:
         await flood_edit(e, head + autodl.job_panel(autodl.CURRENT),
                          parse_mode="html",
