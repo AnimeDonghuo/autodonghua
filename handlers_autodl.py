@@ -259,8 +259,10 @@ async def cmd_status(e):
             f"{autodl.telethon_info()} · build {autodl.BUILD}\n\n")
     m = await flood_respond(e, head + autodl.job_panel(autodl.CURRENT),
                             parse_mode="html",
-                            buttons=[Button.inline("🔄 Refresh",
-                                                   b"jrefresh")])
+                            buttons=[[Button.inline("🔄 Refresh",
+                                                    b"jrefresh"),
+                                      Button.inline("🛑 Cancel ALL",
+                                                    b"jcancelall")]])
     if m is not None:  # THIS message becomes the one live panel;
         await autodl.set_live_panel(m.chat_id, m.id)  # old one dies
 
@@ -279,12 +281,40 @@ async def cb_jrefresh(e):
     try:
         await flood_edit(e, head + autodl.job_panel(autodl.CURRENT),
                          parse_mode="html",
-                         buttons=[Button.inline("🔄 Refresh",
-                                                b"jrefresh")])
+                         buttons=[[Button.inline("🔄 Refresh",
+                                                 b"jrefresh"),
+                                   Button.inline("🛑 Cancel ALL",
+                                                 b"jcancelall")]])
         await autodl.set_live_panel(e.chat_id, e.message_id)
     except Exception:
         pass  # MessageNotModified = nothing changed, fine
     await e.answer("Refreshed")
+
+
+@app.on(events.CallbackQuery(pattern=rb"jcancelall"))
+async def cb_cancel_all(e):
+    """🛑 Cancel ALL button on the live /status panel."""
+    if not await require_staff(e):
+        return
+    n = autodl.cancel_all()
+    await e.answer("Cancelling everything…")
+    await flood_respond(
+        e, f"🛑 <b>Cancel ALL</b> — flagged {n} running job(s); the "
+           f"batch will not start any more queued files. The panel "
+           f"shows the final tally.", parse_mode="html")
+
+
+@app.on(events.NewMessage(pattern=r"^/cancelall$"))
+async def cmd_cancel_all(e):
+    """Owner-only: stop every running + queued AutoDL job."""
+    from core import is_owner
+    if not is_owner(e.sender_id):
+        return await flood_respond(e, "👑 Owner only.")
+    n = autodl.cancel_all()
+    await flood_respond(
+        e, f"🛑 <b>Cancel ALL</b> — flagged {n} running job(s); no "
+           f"queued file will start. Running upload/download aborts "
+           f"within a couple of seconds.", parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/cancel_([a-f0-9]{4,16})$"))

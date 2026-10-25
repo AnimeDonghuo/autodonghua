@@ -61,6 +61,7 @@ COMMAND_MENU = [
     ("addvps", "Add + auto-provision a VPS upload worker"),
     ("vps", "VPS mode on/off + worker status"),
     ("removevps", "Remove the VPS worker"),
+    ("cancelall", "Stop ALL running & queued download jobs"),
 ]
 
 

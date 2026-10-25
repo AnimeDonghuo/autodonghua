@@ -256,7 +256,20 @@ class JobCancelled(Exception):
 # The live job queue: one job runs at a time, the rest stay queued.
 JOBS = {}          # job id -> job dict
 CURRENT = None     # the running job
-BATCH = {"n": 0, "total": 0}
+BATCH = {"n": 0, "total": 0, "stop": False}
+
+
+def cancel_all() -> int:
+    """🛑 Stop EVERYTHING: flag the running job so it aborts at its
+    next chunk/callback, and halt the batch so no queued file starts.
+    Returns how many job(s) were flagged."""
+    n = 0
+    for j in JOBS.values():
+        if j["status"] in ("running", "queued"):
+            j["cancel"] = True
+            n += 1
+    BATCH["stop"] = True
+    return n
 
 
 def _new_job(series, ep, quality, url):
@@ -388,7 +401,7 @@ def job_panel(job=None) -> str:
     queued = max(0, BATCH["total"] - BATCH["n"])
     active = 1 if job and job["status"] == "running" else 0
     lines.append(f"Active/queued: {active} / {queued} · "
-                 f"send /cancel_&lt;id&gt; to stop one")
+                 f"/cancel_&lt;id&gt; stops one · /cancelall stops all")
     return "\n".join(lines)
 
 
@@ -920,6 +933,8 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                                           stream["url"], db_ids[0],
                                           poster)
         if vps_sent is None:
+            if job.get("cancel"):
+                raise JobCancelled()
             if not _disk_ok(0):
                 _free_up(900)
             if not _disk_ok(0):
@@ -938,6 +953,8 @@ async def run_job(group, item, ep, stream, db_ids, poster):
         job["phase"] = "upload"
 
         async def up_cb(sent_bytes, total_bytes):
+            if job["cancel"]:          # abort mid-upload, not just download
+                raise JobCancelled()
             job["up_done"] = sent_bytes
             job["up_total"] = total_bytes
 
@@ -963,6 +980,8 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                 "doc": _doc_ref(vps_sent.document
                                 or vps_sent.video)})
         for dbc in (db_ids[1:] if vps_sent else db_ids):
+            if job.get("cancel"):
+                raise JobCancelled()
             sent = None
             for attempt in (1, 2, 3):  # transient upload errors retry
                 try:
@@ -1085,6 +1104,7 @@ async def run_batch(fresh, force=False):
               "be skipped until it is back")
     BATCH["n"] = 0
     BATCH["skip"] = 0
+    BATCH["stop"] = False
     await store.set_config("pending_batch",
                            {"ts": time.time(), "groups": len(groups)})
     BATCH["total"] = sum(len(todo)
@@ -1097,6 +1117,9 @@ async def run_batch(fresh, force=False):
     done = 0
     try:
         for g in groups:
+            if BATCH.get("stop"):
+                print("[autodl] cancel-all — batch stopped")
+                break
             if await process_group(g, force=force):
                 done += 1
     finally:
@@ -1696,8 +1719,13 @@ async def process_group(group, force=False) -> bool:
     eps_deeps = {}  # ep -> {quality: bot deep link}
     posted_any = False
     for item, todo, all_streams in entries:
+        if BATCH.get("stop"):
+            print("[autodl] cancel-all — group ends early")
+            break
         _, ep = parse_api_title(item.get("title", ""))
         for stream in todo:
+            if BATCH.get("stop"):
+                break
             if not force and await registry_get(
                     norm, ep, stream["quality"]):
                 continue  # another batch already archived this file

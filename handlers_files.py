@@ -481,6 +481,61 @@ def _doc_ref(doc):
     }
 
 
+# busy-gate choice: message id -> the original file event, so the
+# ⚡ button can fast-ingest THAT file once the owner names it
+_BUSY = {}
+
+
+@app.on(events.CallbackQuery(pattern=rb"fbpick"))
+async def cb_busy_fast(e):
+    """⚡ Fast ingest from the busy notice: ask for the name, then run
+    the instant caption-named path on the ORIGINAL file — no LOAD."""
+    from core import wait_for
+    orig = _BUSY.pop(e.message_id, None)
+    if orig is None or orig.sender_id != e.sender_id:
+        return await e.answer("Menu expired — send the file again",
+                              alert=True)
+    await e.answer()
+    await flood_edit(e, "⚡ <b>Fast ingest</b> — reply with the name:\n"
+                        "<code>Series Eps NN [quality]</code>\n"
+                        "e.g. <code>Mushen Ji Eps 106 [720p]</code>\n"
+                        "<i>(180s to answer)</i>",
+                     parse_mode="html", buttons=None)
+    try:
+        r = await wait_for(orig.chat_id, timeout=180)
+    except Exception:
+        r = None
+    if r is None or not (r.text or "").strip():
+        return await flood_respond(
+            orig, "⌛ Fast ingest timed out — send the file again "
+                  "(or name it <code>Series Eps NN [quality]</code> "
+                  "up front).", parse_mode="html")
+    name = r.text.strip()
+    fast = _fast_filename(name)
+    if not fast:
+        return await flood_respond(
+            orig, "❌ That doesn't look like <code>Series Eps NN "
+                  "[quality]</code> — send the file again.",
+            parse_mode="html")
+    media_obj = orig.video or orig.document
+    if media_obj is None:
+        return await flood_respond(orig, "❌ Original file expired — "
+                                         "send it again.")
+    await _fast_ingest(orig, name, fast[0], fast[1], fast[2], media_obj)
+
+
+@app.on(events.CallbackQuery(pattern=rb"fbwait"))
+async def cb_busy_wait(e):
+    _BUSY.pop(e.message_id, None)
+    await e.answer()
+    try:
+        await flood_edit(e, "🐢 OK — send the file again in a minute "
+                            "and I'll run the full slow scan.",
+                         parse_mode="html", buttons=None)
+    except Exception:
+        pass
+
+
 @app.on(events.NewMessage(func=lambda e: (e.document or e.video)
                            and e.is_private))
 async def on_file(e):
@@ -510,14 +565,23 @@ async def on_file(e):
         return
 
     if LOAD.locked():
-        return await flood_respond(e, 
+        m = await flood_respond(e,
             "⏳ <b>One file is being processed right now</b> — "
-            "please wait a few seconds and send it again.\n\n"
-            "<i>(free-tier instances process one file at a time)</i>\n"
-            "💡 <i>Name it</i> <code>Series Eps NN [quality]</code> "
-            "<i>(file name or caption) and I ingest it instantly "
-            "without any waiting.</i>",
-            parse_mode="html")
+            "pick how to handle THIS one:\n\n"
+            "⚡ <b>Fast ingest</b> — give me its name "
+            "(<code>Series Eps NN [quality]</code>) and I ingest it "
+            "instantly, no waiting.\n"
+            "🐢 <b>Slow path</b> — wait a bit and send it again for "
+            "the full mediainfo scan.\n\n"
+            "<i>(free-tier instances process one file at a time)</i>",
+            parse_mode="html",
+            buttons=[[Button.inline("⚡ Fast ingest", b"fbpick"),
+                      Button.inline("🐢 Wait & resend", b"fbwait")]])
+        if m is not None:
+            if len(_BUSY) > 32:
+                _BUSY.pop(next(iter(_BUSY)), None)
+            _BUSY[m.id] = e
+        return
 
     path = None
     status = None
