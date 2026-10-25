@@ -47,6 +47,20 @@ COMMAND_MENU = [
     ("syncbutton", "Admin: sync card buttons + fetch late eng subs"),
     ("sync", "Sync bot command menu"),
     ("usage", "Storage & usage stats"),
+    ("autodl", "Start/stop the API download watcher"),
+    ("status", "Live bot status panel"),
+    ("checknew", "Check new episodes interactively"),
+    ("stats", "Bot stats"),
+    ("get", "Get a stored file by link/tag"),
+    ("settag", "Set a channel tag (eng = eng subs only)"),
+    ("adddbchannel", "Add a TG archive DB channel"),
+    ("dbchannels", "List DB channels"),
+    ("deldbchannel", "Remove a DB channel"),
+    ("setdbchannel", "Set the single legacy DB channel"),
+    ("setstartimg", "Set the /start banner image"),
+    ("addvps", "Add + auto-provision a VPS upload worker"),
+    ("vps", "VPS mode on/off + worker status"),
+    ("removevps", "Remove the VPS worker"),
 ]
 
 
@@ -473,7 +487,7 @@ async def cmd_addvps(e):
     """Register + provision a VPS worker: user, IP, root password,
     worker bot token, koyeb url. The bot SSHes in and installs
     everything itself."""
-    if not await is_owner(e.sender_id):
+    if not is_owner(e.sender_id):
         return await flood_respond(e, "👑 Owner only.")
     parts = (e.text or "").split(None, 1)
     args = parts[1].split() if len(parts) > 1 else []
@@ -520,7 +534,7 @@ async def cmd_addvps(e):
 async def cmd_vps(e):
     """Show / toggle the VPS mode: ON = VPS downloads+uploads and
     Koyeb only posts; OFF = Koyeb handles everything alone."""
-    if not await is_owner(e.sender_id):
+    if not is_owner(e.sender_id):
         return await flood_respond(e, "👑 Owner only.")
     v = dict(await store.get_config("vps") or {})
     if not v.get("secret"):
@@ -595,7 +609,7 @@ async def vps_watchdog_loop():
 
 @app.on(events.NewMessage(pattern=r"^/removevps$"))
 async def cmd_removevps(e):
-    if not await is_owner(e.sender_id):
+    if not is_owner(e.sender_id):
         return await flood_respond(e, "👑 Owner only.")
     v = dict(await store.get_config("vps") or {})
     if v.get("ssh"):
