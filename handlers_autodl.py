@@ -220,12 +220,18 @@ async def cb_sel_done(e):
         if len(SEL_EXEC) > 32:
             SEL_EXEC.pop(next(iter(SEL_EXEC)), None)
         SEL_EXEC[e.message_id] = picked
+
+        def _lane(free):
+            return ("🟢 idle — starts instantly" if free else
+                    "⏳ busy — queues behind its current task")
         await flood_edit(e,
             f"⏳ <b>Queue ready</b> — {len(picked)} episode(s), "
             f"{n_files} file(s).\n\n"
             f"🛰 <b>Run it on…</b>\n"
-            f"☁️ <b>Koyeb</b> — this server downloads+uploads\n"
-            f"🖥 <b>VPS</b> — your worker downloads+uploads "
+            f"☁️ <b>Koyeb</b> — downloads+uploads here · "
+            f"{_lane(not autodl.LOAD.locked())}\n"
+            f"🖥 <b>VPS</b> — your worker does it · "
+            f"{_lane(not autodl.LOAD_V.locked())} "
             + ("(online ✅)" if vst.get("online") else
                "(OFFLINE ⚠️ — falls back to Koyeb per file)"),
             parse_mode="html",
@@ -240,9 +246,18 @@ async def _start_picked(e, picked, executor="auto"):
     n_files = sum(len(t) for _, t, _ in picked)
     where = {"koyeb": "☁️ Koyeb", "vps": "🖥 VPS worker",
              "auto": "auto (VPS if online, else Koyeb)"}[executor]
+    # the picked machine idle → it starts RIGHT NOW even while the
+    # other machine is still busy with its own batch
+    if autodl.lane_free(executor):
+        head = (f"🚀 <b>Starting now on {where}</b> — that server "
+                f"is idle, so nothing waits.")
+    else:
+        head = (f"⏳ <b>Queued on {where}</b> — it finishes its "
+                f"current task first, then yours starts "
+                f"automatically.")
     await flood_edit(e,
-        f"⏳ <b>Queue started on {where}</b> — {len(picked)} "
-        f"episode(s), {n_files} file(s), one by one.\n\n"
+        f"{head}\n\n{len(picked)} episode(s), {n_files} file(s), "
+        f"one by one.\n\n"
         f"📩 Live progress panel is in the owner's DM.",
         parse_mode="html", buttons=None)
 
@@ -621,7 +636,7 @@ async def cmd_syncbutton(e):
     upload it now. Queue is paused while the sweep runs."""
     if not await require_staff(e):
         return
-    if autodl.LOAD.locked():
+    if autodl.busy():
         autodl.SYNC_REQ["on"] = True
         return await flood_respond(
             e, "🔄 <b>Sync queued</b> — the episode currently "
@@ -631,8 +646,9 @@ async def cmd_syncbutton(e):
                "lands in your DM.", parse_mode="html")
 
     async def _run():
-        async with autodl.LOAD:
-            await autodl.sync_buttons_pass()
+        async with autodl.LOAD_V, autodl.LOAD:
+            await autodl.sync_buttons_pass(
+                locks=(autodl.LOAD_V, autodl.LOAD))
     asyncio.ensure_future(_run())
     await flood_respond(
         e, "🔄 <b>Sync started</b> — checking every channel card "

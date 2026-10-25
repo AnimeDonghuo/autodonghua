@@ -213,7 +213,9 @@ START_TS = time.time()
 PENDING = {}   # post key -> pending post dict (confirmation flow)
 WAITERS = {}   # chat_id -> (asyncio.Future, filter_fn) for conversations
 AUTH = set()   # staff user ids that passed /login
-LOAD = asyncio.Lock()   # serializes file processing (protects free-tier CPU/RAM)
+LOAD = asyncio.Lock()    # Koyeb lane: ONE local file at a time (free-tier CPU/RAM)
+LOAD_V = asyncio.Lock()  # VPS lane: a batch picked for the VPS runs CONCURRENTLY
+                         # with a Koyeb-lane batch — different machines, no clash
 DEFAULT_PASS = "AYU"
 
 

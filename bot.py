@@ -63,10 +63,10 @@ async def main():
             st = await autodl.get_settings()
             if not pend and not st.get("enabled"):
                 return
-            if autodl.LOAD.locked():
+            if autodl.busy():
                 return
             fresh = await autodl.check_new()
-            if fresh and not autodl.LOAD.locked():
+            if fresh and not autodl.busy():
                 print(f"[autodl] resume after restart: {len(fresh)} "
                       f"episode(s) incomplete — queueing")
                 await autodl.start_batch(fresh)

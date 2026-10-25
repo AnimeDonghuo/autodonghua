@@ -32,7 +32,7 @@ from telethon.tl.types import (DocumentAttributeVideo)
 
 from config import CONFIG, DOWNLOAD_DIR
 import core as core_mod
-from core import (LOAD, app, forcesub_check, invite_link,
+from core import (LOAD, LOAD_V, app, forcesub_check, invite_link,
                   store, url_bytes)
 from handlers_user import forcesub_gate
 from mediainfo_util import analyze, human_size
@@ -253,23 +253,48 @@ class JobCancelled(Exception):
     """Owner tapped /cancel_<id>."""
 
 
-# The live job queue: one job runs at a time, the rest stay queued.
+# The live job queue: each MACHINE LANE runs one file at a time.
 JOBS = {}          # job id -> job dict
 CURRENT = None     # the running job (lane 1)
-CURRENT2 = None    # lane 2 — only used while /parallel is on
-BATCH = {"n": 0, "total": 0, "stop": False}
+CURRENT2 = None    # lane 2 — /parallel batches & a 2nd concurrent batch
+BATCHES = {}       # id(state) -> per-batch state; a Koyeb batch and a
+                   # VPS batch can run AT THE SAME TIME (separate
+                   # machines), so counters/stop-flags are per-batch
+
+
+def busy() -> bool:
+    """Any batch running on ANY lane?"""
+    return LOAD.locked() or LOAD_V.locked()
+
+
+def lane_free(executor) -> bool:
+    """Would a batch with this executor start on its machine RIGHT
+    NOW? An idle picked server must never queue behind the other
+    machine's work."""
+    if executor == "koyeb":
+        return not LOAD.locked()
+    if executor == "vps":
+        return not LOAD_V.locked()
+    return not busy()
+
+
+def _batch_agg():
+    """Combined n/total across every active batch (panel header)."""
+    return (sum(s["n"] for s in BATCHES.values()),
+            sum(s["total"] for s in BATCHES.values()))
 
 
 def cancel_all() -> int:
-    """🛑 Stop EVERYTHING: flag the running job so it aborts at its
-    next chunk/callback, and halt the batch so no queued file starts.
-    Returns how many job(s) were flagged."""
+    """🛑 Stop EVERYTHING: flag the running jobs so they abort at
+    their next chunk/callback, and halt EVERY active batch so no
+    queued file starts. Returns how many job(s) were flagged."""
     n = 0
     for j in JOBS.values():
         if j["status"] in ("running", "queued"):
             j["cancel"] = True
             n += 1
-    BATCH["stop"] = True
+    for s in BATCHES.values():
+        s["stop"] = True
     return n
 
 
@@ -397,8 +422,9 @@ def job_panel(job=None) -> str:
     # promote it so the panel never says "starting…" over a live job
     if job is None:
         job = CURRENT or CURRENT2
+    agg_n, agg_total = _batch_agg()
     if job is None:
-        lines.append(f"⏳ {BATCH['total']} file(s) queued — "
+        lines.append(f"⏳ {agg_total} file(s) queued — "
                      f"starting…")
     else:
         state = {"running": ("Running" if job["phase"] == "download"
@@ -407,7 +433,7 @@ def job_panel(job=None) -> str:
                  "cancelled": "Cancelled"}[job["status"]]
         lines.append(f"🎬 {escape_html(job['title'])} "
                      f"Eps {job['ep']} [{job['quality']}]")
-        lines.append(f"📋 Video {BATCH['n']}/{BATCH['total']} "
+        lines.append(f"📋 Video {agg_n}/{agg_total} "
                      f"· {state}")
         lines.append("🛰 Running on: "
                      + ("<b>🖥 VPS worker</b>"
@@ -433,7 +459,7 @@ def job_panel(job=None) -> str:
     lines.append("")
     lines.append(f"📊 Container CPU: {cpu:.0f}% of quota · "
                  f"RAM: {ram:.1f} MiB / {total:.1f} MiB")
-    queued = max(0, BATCH["total"] - BATCH["n"])
+    queued = max(0, agg_total - agg_n)
     active = sum(1 for j in (CURRENT, CURRENT2)
                  if j is not None and j.get("status") == "running")
     lines.append(f"Active/queued: {active} / {queued} · "
@@ -978,11 +1004,12 @@ async def _vps_archive(job, series, ep, q, url, db0, poster,
 
 
 async def run_job(group, item, ep, stream, db_ids, poster,
-                  executor="auto"):
+                  executor="auto", st=None):
     """One queued file: download (with live progress + cancel),
     archive in every DB channel (with upload progress), register.
     executor: 'auto' (VPS when mode ON + online, else Koyeb),
-    'koyeb' (never VPS) or 'vps' (force VPS when online)."""
+    'koyeb' (never VPS) or 'vps' (force VPS when online).
+    st = the owning batch's state (counters + held lane locks)."""
     global CURRENT, CURRENT2
     series = group["series"]
     norm = group["norm"]
@@ -993,11 +1020,14 @@ async def run_job(group, item, ep, stream, db_ids, poster,
         CURRENT = job
     else:
         CURRENT2 = job   # /parallel: second lane
-    BATCH["n"] += 1
-    print(f"[autodl] job {BATCH['n']}/{BATCH['total']} start: "
+    if st is None:
+        st = {"n": 0, "total": 0, "locks": ()}
+    st["n"] += 1
+    print(f"[autodl] job {st['n']}/{st['total']} start: "
           f"{series} Ep {ep} [{q}]")
     fname = f"{norm}_{ep}_{q}.mp4".replace(" ", "_")
     path = os.path.join(DOWNLOAD_DIR, fname)
+    _fb_lock = False
     try:
         vps_sent = None
         if executor != "koyeb":
@@ -1022,6 +1052,14 @@ async def run_job(group, item, ep, stream, db_ids, poster,
         if vps_sent is None:
             if job.get("cancel"):
                 raise JobCancelled()
+            if LOAD not in st.get("locks", ()):
+                # A VPS-lane batch falling back to Koyeb: take the
+                # Koyeb lane lock first, so the free tier NEVER runs
+                # two local files at once even when a Koyeb batch is
+                # going. Lock order is V-then-K everywhere (same as
+                # start_batch), so this can't deadlock.
+                await LOAD.acquire()
+                _fb_lock = True
             if not _disk_ok(0):
                 _free_up(900)
             if not _disk_ok(0):
@@ -1139,6 +1177,8 @@ async def run_job(group, item, ep, stream, db_ids, poster,
         job["error"] = str(exc)
         print(f"[autodl] download failed {series} ep{ep} {q}: {exc}")
     finally:
+        if _fb_lock:
+            LOAD.release()
         try:
             os.remove(path)
         except Exception:
@@ -1181,35 +1221,68 @@ async def serve_deeplink(e, payload: str) -> bool:
     return True
 
 
+def _locks_for(executor):
+    """Lane lock(s) an executor needs. 'auto' may run files on BOTH
+    machines (parallel mode / VPS fallbacks), so it takes both —
+    always V-then-K, the one global acquisition order (run_job's
+    fallback wants K while holding V; any other order could
+    deadlock)."""
+    if executor == "koyeb":
+        return (LOAD,)
+    if executor == "vps":
+        return (LOAD_V,)
+    return (LOAD_V, LOAD)
+
+
 async def start_batch(fresh, force=False, executor="auto"):
-    """Run one batch under the global lock (watcher, /checknew,
-    /searchad). force=True re-downloads even archived qualities.
-    executor: auto | koyeb | vps (per-batch pick)."""
-    async with LOAD:
-        return await run_batch(fresh, force=force, executor=executor)
+    """Run one batch under ITS OWN machine's lane lock (watcher,
+    /checknew, /searchad). force=True re-downloads even archived
+    qualities. executor: auto | koyeb | vps (per-batch pick).
+    An explicit ☁️/🖥 pick only holds THAT lane — when the picked
+    server is idle the batch starts IMMEDIATELY, even while the
+    other machine is still busy with its own batch."""
+    locks = _locks_for(executor)
+    for lk in locks:
+        await lk.acquire()
+    try:
+        return await run_batch(fresh, force=force,
+                               executor=executor, locks=locks)
+    finally:
+        for lk in reversed(locks):
+            lk.release()
 
 
-async def run_batch(fresh, force=False, executor="auto"):
+async def run_batch(fresh, force=False, executor="auto", locks=()):
     """Process every fresh episode through the job queue, with a
-    live progress panel DM'd to the owner."""
+    live progress panel DM'd to the owner. 'locks' = the lane locks
+    the CALLER already holds (start_batch) — carried in the batch
+    state so run_job never re-acquires a lock this task owns.
+    A Koyeb batch and a VPS batch may run CONCURRENTLY: each keeps
+    its own counters, and only the FIRST active batch owns/creates
+    the live panel (one panel for everything, per design)."""
     groups = group_fresh(fresh)
     if not groups:
         return 0
     if not await store.ensure_mongo(45):
         print("[autodl] WARNING: MongoDB unreachable — archives will "
               "be skipped until it is back")
-    BATCH["n"] = 0
-    BATCH["skip"] = 0
-    BATCH["stop"] = False
     await store.set_config("pending_batch",
                            {"ts": time.time(), "groups": len(groups)})
-    BATCH["total"] = sum(len(todo)
-                         for g in groups
-                         for _, todo, _ in g["entries"])
-    msg = await _owner_dm(job_panel(None), buttons=PANEL_BUTTONS)
-    if msg is not None:
-        await set_live_panel(getattr(msg, "chat_id", None),
-                             getattr(msg, "id", None))
+    total = sum(len(todo)
+                for g in groups
+                for _, todo, _ in g["entries"])
+    # no await between the emptiness check and registering — the
+    # event loop makes check+register atomic, so exactly one
+    # concurrent batch ever owns the panel
+    st = {"n": 0, "total": total, "skip": 0, "stop": False,
+          "ok": 0, "bad": 0, "can": 0, "locks": tuple(locks),
+          "panel": not BATCHES}
+    BATCHES[id(st)] = st
+    if st["panel"]:
+        msg = await _owner_dm(job_panel(None), buttons=PANEL_BUTTONS)
+        if msg is not None:
+            await set_live_panel(getattr(msg, "chat_id", None),
+                                 getattr(msg, "id", None))
     done = 0
     par = False
     if executor == "auto" and await _parallel_on():
@@ -1235,11 +1308,11 @@ async def run_batch(fresh, force=False, executor="auto"):
             async def _lane(gs, ex):
                 d = 0
                 for g in gs:
-                    if BATCH.get("stop"):
+                    if st.get("stop"):
                         print("[autodl] cancel-all — lane stopped")
                         break
                     if await process_group(g, force=force,
-                                           executor=ex):
+                                           executor=ex, st=st):
                         d += 1
                 return d
             ra, rb = await asyncio.gather(_lane(lane_a, "koyeb"),
@@ -1247,18 +1320,17 @@ async def run_batch(fresh, force=False, executor="auto"):
             done += ra + rb
         else:
             for g in groups:
-                if BATCH.get("stop"):
+                if st.get("stop"):
                     print("[autodl] cancel-all — batch stopped")
                     break
                 if await process_group(g, force=force,
-                                       executor=executor):
+                                       executor=executor, st=st):
                     done += 1
     finally:
-        ok = sum(1 for j in JOBS.values() if j["status"] == "done")
-        bad = sum(1 for j in JOBS.values() if j["status"] == "failed")
-        can = sum(1 for j in JOBS.values()
-                  if j["status"] == "cancelled")
-        if PANEL["chat"]:
+        BATCHES.pop(id(st), None)
+        last = not BATCHES   # the last batch standing does cleanup
+        ok, bad, can = st["ok"], st["bad"], st["can"]
+        if last and PANEL["chat"]:
             cpu, ram, total = container_stats()
             try:
                 await app.edit_message(
@@ -1267,9 +1339,9 @@ async def run_batch(fresh, force=False, executor="auto"):
                     f"⬇️ archived: <b>{ok}</b> · ❌ failed: <b>{bad}</b>"
                     f" · 🛑 cancelled: <b>{can}</b>\n"
                     f"📺 posted: <b>{done}</b> episode card(s)\n"
-                    + (f"⚠️ skipped: <b>{BATCH.get('skip', 0)}</b> "
+                    + (f"⚠️ skipped: <b>{st.get('skip', 0)}</b> "
                        f"group(s) — no DB channel / storage offline\n"
-                       if BATCH.get("skip") else "")
+                       if st.get("skip") else "")
                     + "\n"
                     f"📊 Container CPU: {cpu:.0f}% of quota · "
                     f"RAM: {ram:.1f} MiB / {total:.1f} MiB",
@@ -1294,13 +1366,15 @@ async def run_batch(fresh, force=False, executor="auto"):
         if SYNC_REQ["on"]:  # /syncbutton: full sweep after the batch
             SYNC_REQ["on"] = False
             try:
-                await sync_buttons_pass()
+                # pass the held lane locks down — the nested batch's
+                # Koyeb fallbacks must never re-acquire what this
+                # task already owns
+                await sync_buttons_pass(locks=st["locks"])
             except Exception as exc:
                 print("[autodl] syncbutton pass failed:",
                       repr(exc)[:200])
-        await store.set_config("pending_batch", None)
-        JOBS.clear()
-        BATCH["n"] = BATCH["total"] = 0
+        if last:
+            await store.set_config("pending_batch", None)
     return done
 
 
@@ -1839,13 +1913,13 @@ async def _parallel_on() -> bool:
 
 
 async def _run_stream(group, item, ep, stream, db_ids, poster,
-                      executor="auto"):
+                      executor="auto", st=None):
     """One file of a group: run_job with one retry, honest failure
     reporting and lane cleanup. Returns True when it archived."""
     global CURRENT, CURRENT2
     series = group["series"]
     # one stalled file must never kill the whole batch or
-    # hold the global lock forever
+    # hold a lane lock forever
     err = None
     job = None
     for attempt in (1, 2):  # one retry before giving up
@@ -1854,7 +1928,7 @@ async def _run_stream(group, item, ep, stream, db_ids, poster,
         try:
             job = await asyncio.wait_for(
                 run_job(group, item, ep, stream, db_ids, poster,
-                        executor=executor),
+                        executor=executor, st=st),
                 timeout=5400)
         except asyncio.TimeoutError:
             err = "timeout (90 min)"
@@ -1878,10 +1952,25 @@ async def _run_stream(group, item, ep, stream, db_ids, poster,
             CURRENT = None
         if CURRENT2 is tgt:
             CURRENT2 = None
+        if tgt is not None:
+            JOBS.pop(tgt.get("id"), None)  # a dead attempt leaves the
+            # registry at once — /cancel_<id> only finds live jobs
         _free_up(900)
         if err == "disk low" or err.startswith("archive"):
             break  # re-downloading cannot fix disk/channel
         await asyncio.sleep(3)
+    if job is not None:
+        # per-batch tallies for the summary (the JOBS registry is
+        # shared between concurrent batches — never clear it whole)
+        if st is not None:
+            _s = job.get("status")
+            if _s == "done":
+                st["ok"] += 1
+            elif _s == "failed":
+                st["bad"] += 1
+            elif _s == "cancelled":
+                st["can"] += 1
+        JOBS.pop(job.get("id"), None)
     if err:  # never silent: tell the owner
         print("[autodl] job FAILED:", series, "Ep", ep,
               stream["quality"], err)
@@ -1892,17 +1981,20 @@ async def _run_stream(group, item, ep, stream, db_ids, poster,
     return err is None
 
 
-async def process_group(group, force=False, executor="auto") -> bool:
+async def process_group(group, force=False, executor="auto",
+                        st=None) -> bool:
     """Download every missing quality of every new episode (one by
     one), archive in the DB channel, then ONE designed poster post
     per series with quality buttons covering the episode range."""
     global CURRENT
+    if st is None:
+        st = {"skip": 0, "stop": False}
     db_ids = await store.db_channel_ids()
     if not db_ids:  # maybe we are mid-blip on local JSON
         await store.ensure_mongo(15)
         db_ids = await store.db_channel_ids()
     if not db_ids:
-        BATCH["skip"] = BATCH.get("skip", 0) + 1
+        st["skip"] = st.get("skip", 0) + 1
         print("[autodl] no DB channel set — skipping group")
         return False
 
@@ -1916,7 +2008,7 @@ async def process_group(group, force=False, executor="auto") -> bool:
     eps_deeps = {}  # ep -> {quality: bot deep link}
     posted_any = False
     for item, todo, all_streams in entries:
-        if BATCH.get("stop"):
+        if st.get("stop"):
             print("[autodl] cancel-all — group ends early")
             break
         _, ep = parse_api_title(item.get("title", ""))
@@ -1927,10 +2019,10 @@ async def process_group(group, force=False, executor="auto") -> bool:
                 continue  # another batch already archived this file
             pend.append(stream)
         for stream in pend:
-            if BATCH.get("stop"):
+            if st.get("stop"):
                 break
             await _run_stream(group, item, ep, stream, db_ids,
-                              poster, executor)
+                              poster, executor, st)
 
         links = {}
         deeps = {}
@@ -2123,8 +2215,10 @@ async def _eng_pending_pass(st) -> int:
     return done
 
 
-async def sync_buttons_pass(notify=True):
-    """The /syncbutton sweep (call with LOAD held): 1) top up every
+async def sync_buttons_pass(notify=True, locks=()):
+    """The /syncbutton sweep (call with the lane locks held, and
+    pass them in 'locks' so the nested batch never re-acquires
+    them): 1) top up every
     card whose episode has more archived qualities than its buttons,
     2) for every indo card whose eng sub was missing, ask the search
     API — if eng landed, download+upload it now; otherwise remember
@@ -2169,7 +2263,8 @@ async def sync_buttons_pass(notify=True):
                 break
     downloaded = 0
     if entries:
-        downloaded = await run_batch(entries)  # LOAD already held
+        # lane locks already held by the caller
+        downloaded = await run_batch(entries, locks=locks)
     if notify:
         await _owner_dm(
             f"🔄 <b>Sync-button pass done</b>\n\n"
@@ -2192,7 +2287,7 @@ async def eng_pending_loop():
     while True:
         try:
             st = await get_settings()
-            if not LOAD.locked():
+            if not busy():
                 n = await _eng_pending_pass(st)
                 if n:
                     print(f"[autodl] eng-pending pass finished "
@@ -2214,7 +2309,7 @@ async def autodl_loop():
                 try:
                     fresh = await check_new()
                     if fresh:
-                        if LOAD.locked():
+                        if busy():
                             print("[autodl] batch already running — "
                                   "watcher skips re-queueing")
                         else:
