@@ -55,10 +55,21 @@ printf '{"base": "%s", "secret": "%s"}\n' "${BASE%/}" "$SECRET" > vps_worker.jso
 chmod 600 vps_worker.json
 
 pkill -f vps_worker.py 2>/dev/null
+# procps-free kill scan: minimal images lack pkill, and a missed
+# old worker next to a new one = duplicate jobs + wiped downloads
+for d in /proc/[0-9]*; do
+  a=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null)
+  [ -z "$a" ] && continue
+  case "$(echo "$a" | head -1)" in *python*)
+    echo "$a" | grep -qx -e vps_worker.py -e '.*/vps_worker.py' \
+      && kill "${d#/proc/}" 2>/dev/null;;
+  esac
+done
+sleep 1
 nohup python3 vps_worker.py > vps_worker.log 2>&1 &
 sleep 3
 if grep -q "worker starting" vps_worker.log 2>/dev/null; then
-  echo "✅ worker running (pid $(pgrep -f vps_worker.py | head -1)) — log: vps_worker.log"
+  echo "✅ worker running (pid $(pgrep -f vps_worker.py 2>/dev/null | head -1)) — log: vps_worker.log"
   echo "   Now flip it on in Telegram: /vps on"
 else
   echo "❌ worker did not start — tail vps_worker.log:"; tail -5 vps_worker.log

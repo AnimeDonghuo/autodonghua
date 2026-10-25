@@ -41,7 +41,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
-BUILD = "2026-10-25-e"  # stamp shown in /status — proves deploy freshness
+BUILD = "2026-10-25-f"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
@@ -675,15 +675,33 @@ BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "Chrome/124.0.0.0 Safari/537.36")
 
 
+MIN_VIDEO_BYTES = 1024 * 1024   # no episode video is ever smaller —
+                                # a 3 KB "video" is a CDN error page
+
+
 async def download_stream(url: str, dest: str, job=None) -> str:
     """Download with HTTP-range RESUME: a restart mid-file picks up
     from the bytes already on disk instead of starting over.
 
     Sent with real browser headers — episode CDNs answer a bare
     python/aiohttp User-Agent with 403 Forbidden — and a 403 is
-    retried once with a Referer before giving up."""
+    retried once with a Referer before giving up.
+
+    VALIDATED: dead CDN links (the API's 720p ones expire a lot)
+    often answer HTTP 200 with a tiny text/html error PAGE — that
+    garbage used to be archived as a 'video' and wired into the
+    episode card. An error-page content-type, a truncated body or
+    anything under MIN_VIDEO_BYTES now raises instead, so the file
+    gets a fresh url or fails VISIBLY — never poisoned."""
     have = os.path.getsize(dest) if os.path.exists(dest) else 0
-    s, timeout = http_session(900)
+    s, _ = http_session(900)
+    # total=None: a big 720p/1080p file on a slow line can take far
+    # longer than any fixed TOTAL timeout — the old 900 s total cap
+    # killed large transfers mid-file (part of the "720p issue").
+    # Bound the STALL instead: 180 s without a single byte = dead
+    # transfer, but a slow-yet-moving one may run as long as needed.
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30,
+                                    sock_read=180)
     loop = asyncio.get_running_loop()
     last_status = 0
     for extra in ({}, {"Referer": "https://api.parciv.workers.dev/"}):
@@ -709,6 +727,13 @@ async def download_stream(url: str, dest: str, job=None) -> str:
                 done = 0
             else:
                 raise RuntimeError(f"HTTP {r.status}")
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if ctype.startswith(("text/html", "application/json",
+                                 "text/plain", "text/xml",
+                                 "application/xml")):
+                raise RuntimeError(
+                    f"CDN served an error page ({ctype}, HTTP "
+                    f"{r.status}), not a video — the link is dead")
             if job is not None:
                 job["total"] = total
             last = time.time()
@@ -728,6 +753,13 @@ async def download_stream(url: str, dest: str, job=None) -> str:
                             job["speed"] = ((done - last_done)
                                             / (now - last))
                             last, last_done = now, done
+            if total and done < total:
+                raise RuntimeError(f"truncated download: {done}/"
+                                   f"{total} bytes — CDN dropped it")
+            if done < MIN_VIDEO_BYTES:
+                raise RuntimeError(
+                    f"file is only {done} B — no episode is that "
+                    "small; dead CDN link (error page body)")
             return dest
     raise RuntimeError(f"HTTP {last_status} (CDN blocked both header "
                        f"flavours)")
@@ -1059,6 +1091,12 @@ async def _vps_archive(job, series, ep, q, url, db0, poster,
         if prog and (time.time() - prog.get("ts", 0)) < 30:
             # live VPS progress into the normal job/panel fields
             job.pop("fb", None)   # the worker IS on it now — any
+            # progress flowing = the worker is ALIVE on this file:
+            # a big 720p transfer can legitimately outrun the flat
+            # 20-min deadline, which used to make Koyeb steal (and
+            # DOUBLE-archive) a job that was still working — push
+            # the deadline out while reports keep arriving
+            deadline = time.time() + 10 * 60
             ph = prog.get("phase") or job["phase"]   # reason is moot
             job["phase"] = ph
             if ph == "upload":
@@ -1172,6 +1210,23 @@ async def run_job(group, item, ep, stream, db_ids, poster,
             elif wants_vps and vps.get("secret") \
                     and not job.get("cancel"):
                 job["fb"] = "worker offline"
+        if vps_sent is not None:
+            _sz = getattr(getattr(vps_sent, "file", None),
+                          "size", 0) or 0
+            if 0 < _sz < MIN_VIDEO_BYTES:
+                # an OLD worker with no size gate archived a CDN
+                # error page — refuse it, wipe it from the DB
+                # channel, and redo the file on the validated path
+                print(f"[autodl] VPS archived a {_sz} B broken file "
+                      "— deleting + redoing on Koyeb")
+                try:
+                    await app.delete_messages(int(db_ids[0]),
+                                              [vps_sent.id])
+                except Exception:
+                    pass
+                vps_sent = None
+                job["fb"] = (f"worker archived a broken {_sz} B file "
+                             "(dead CDN link) — deleted, redoing")
         job["via"] = "VPS" if vps_sent is not None else "Koyeb"
         if vps_sent is not None:
             job.pop("fb", None)
@@ -2254,6 +2309,7 @@ async def refresh_stream_url(series, ep, quality, old_url=""):
             continue
         if not item:
             continue
+        same = ""
         for s in item.get("streams", []):
             q2 = (s.get("quality") or "").lower()
             b2 = q2.split("-")[0]
@@ -2262,11 +2318,17 @@ async def refresh_stream_url(series, ep, quality, old_url=""):
             if b2 != base or eng != _has_eng(q2):
                 continue
             url = s.get("url") or ""
-            if url:
-                if url != old_url:
-                    print(f"[autodl] refreshed {quality} url for "
-                          f"{series} Ep {ep}")
+            if not url:
+                continue
+            if url != old_url:
+                # the API can list several streams for one quality —
+                # when the one we had is dead, prefer a DIFFERENT one
+                print(f"[autodl] refreshed {quality} url for "
+                      f"{series} Ep {ep}")
                 return url
+            same = same or url
+        if same:
+            return same
     return None
 
 
@@ -2276,9 +2338,13 @@ async def _download_fresh(stream, path, job, series, ep, q):
     try:
         await download_stream(stream["url"], path, job)
         return
-    except RuntimeError as rex:
-        if "404" not in str(rex) and "403" not in str(rex):
-            raise
+    except JobCancelled:
+        raise
+    except Exception:
+        # HTTP 403/404, an error-page body, a truncated or a
+        # too-small file, a stalled/dead connection — ALL of these
+        # mean the CDN link went bad, so re-query the API and retry
+        # ONCE with a fresh url before failing the file
         fresh = await refresh_stream_url(series, ep, q, stream["url"])
         if not fresh:
             raise

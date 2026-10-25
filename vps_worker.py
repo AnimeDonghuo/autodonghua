@@ -53,6 +53,8 @@ CFG_PATH = os.path.join(HERE, "vps_worker.json")
 DL = os.path.join(HERE, "dl")
 
 CFG = {}
+MIN_VIDEO_BYTES = 1024 * 1024   # anything smaller is a CDN error
+                                # page, never an episode video
 _PROG = {"last": 0.0}
 _COUNT = {"bytes": 0, "t0": time.time()}
 _ACTIVE = {"job": None, "phase": "", "total": 0}   # the beat
@@ -161,6 +163,17 @@ def download(url, path, job_id):
                 continue
             raise
     with r, open(path, "wb") as fh:
+        # dead CDN links (the API's expire constantly) often answer
+        # HTTP 200 with a tiny text/html error PAGE — uploading
+        # that garbage poisoned the DB channel + episode cards, so
+        # every byte is validated BEFORE it can be archived
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype.startswith(("text/html", "application/json",
+                             "text/plain", "text/xml",
+                             "application/xml")):
+            raise RuntimeError(
+                f"CDN served an error page ({ctype}), not a video "
+                "— the link is dead")
         total = int(r.headers.get("Content-Length") or 0)
         while True:
             chunk = r.read(1 << 22)   # 4 MB reads — fewer syscalls
@@ -170,6 +183,12 @@ def download(url, path, job_id):
             done += len(chunk)
             _COUNT["bytes"] = done
             progress(job_id, "download", done, total)
+    if total and done < total:
+        raise RuntimeError(f"truncated download: {done}/{total} B")
+    if done < MIN_VIDEO_BYTES:
+        raise RuntimeError(
+            f"file is only {done} B — no episode is that small; "
+            "dead CDN link (error page body)")
     secs = max(0.25, time.time() - t0)
     return done, done / secs / 1048576  # bytes, MB/s
 
@@ -387,6 +406,40 @@ def _beat_loop():
         time.sleep(1)
 
 
+def _other_worker_running():
+    """PID of ANOTHER live vps_worker.py process, or 0. Pure /proc
+    argv walk — no pgrep needed (minimal boxes lack procps, and a
+    watchdog that can't see the process starts a SECOND worker
+    whose boot sweep deletes this one's in-progress downloads —
+    the '720p file silently removed' mystery). Matching rule:
+    argv[0] contains python AND one exact argv element is
+    [path/]vps_worker.py, so SSH wrapper shells (bash -c '…
+    vps_worker.py …') can never count."""
+    me = os.getpid()
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except Exception:
+        return 0
+    for d in pids:
+        pid = int(d)
+        if pid == me:
+            continue
+        try:
+            with open("/proc/" + d + "/cmdline", "rb") as fh:
+                argv = [a for a in fh.read().split(b"\0") if a]
+        except Exception:
+            continue
+        if not argv:
+            continue
+        argv = [a.decode("utf-8", "replace") for a in argv]
+        if "python" not in argv[0]:
+            continue
+        if any(a == "vps_worker.py" or a.endswith("/vps_worker.py")
+               for a in argv[1:]):
+            return pid
+    return 0
+
+
 def main():
     global CFG
     if not os.path.exists(CFG_PATH):
@@ -396,8 +449,19 @@ def main():
     if CFG["base"] and "://" not in CFG["base"]:
         CFG["base"] = "https://" + CFG["base"]  # bare host ok
     os.makedirs(DL, exist_ok=True)
-    sweep(0)   # boot wipe: anything in dl/ is a leftover of a
-               # killed run (SIGTERM/reboot never runs cleanup)
+    other = _other_worker_running()
+    if other:
+        # TWO workers = duplicate job claims AND the second one's
+        # boot sweep deleting the first one's active downloads —
+        # refuse to start instead
+        sys.exit("another vps_worker.py is already running (pid "
+                 + str(other) + ") — exiting so its downloads stay "
+                 "safe; check worker.log for why this was started")
+    sweep(2)   # boot tidy: anything in dl/ older than 2 MINUTES is
+               # a leftover of a killed run (SIGTERM/reboot never
+               # runs cleanup) — the 2-min floor means even an
+               # accidental double-start can never wipe a download
+               # that is actively being written
     threading.Thread(target=_beat_loop, daemon=True).start()
     client = None
     log(f"worker starting → {CFG['base']}")

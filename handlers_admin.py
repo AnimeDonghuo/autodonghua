@@ -487,8 +487,8 @@ async def _provision(chat_id, msg):
         #    compound command the shell's own cmdline contains the
         #    literal 'vps_worker.py' (the nohup part) and pkill -f
         #    would kill the shell before the worker ever starts
-        await ssh_exec(cfg, "pkill -f '[v]ps_worker.py' || true; "
-                            "sleep 1", 30)
+        await ssh_exec(cfg, "pkill -f '[v]ps_worker.py' 2>/dev/null; "
+                            + _KILL_SCAN + "; sleep 1", 30)
         # 2) start the new one — pidfile pattern: stdout/stderr to the
         #    log, stdin from /dev/null, pid into worker.pid (a plain
         #    '& echo $!' capture keeps the SSH channel/pipe open and
@@ -501,8 +501,9 @@ async def _provision(chat_id, msg):
         pid = (out or "").strip().splitlines()[-1].strip() if out else ""
         # 3) honest liveness check — this shell has NO literal in it
         await asyncio.sleep(2)
-        rc, out, _ = await ssh_exec(cfg, "pgrep -f '[v]ps_worker.py' "
-                                         "|| echo NONE", 30)
+        rc, out, _ = await ssh_exec(
+            cfg, "pgrep -f '[v]ps_worker.py' 2>/dev/null; " + _PS_SCAN,
+            30)
         if "NONE" in (out or "") or not (out or "").strip():
             rc, lg, _ = await ssh_exec(
                 cfg, f"tail -5 {home}/{VPS_DIR}/worker.log 2>/dev/null",
@@ -631,8 +632,9 @@ async def cmd_vps(e):
         if ssh:
             try:
                 _, out, _e = await ssh_exec(
-                    ssh, "pgrep -f '[v]ps_worker.py' >/dev/null 2>&1 "
-                         "&& echo RUNNING || echo STOPPED", 25)
+                    ssh, "if [ -n \"$(pgrep -f '[v]ps_worker.py' "
+                         "2>/dev/null; " + _PS_SCAN + ")\" ]; then "
+                         "echo RUNNING; else echo STOPPED; fi", 25)
                 lines.append("Process: <code>"
                              + escape_html((out or "?").strip()) + "</code>")
                 _, lg, _e = await ssh_exec(
@@ -706,6 +708,106 @@ async def cmd_vps(e):
     await flood_respond(e, "\n".join(lines), parse_mode="html")
 
 
+@app.on(events.NewMessage(pattern=r"^/fixsmall(?: (go|dry))?$"))
+async def cmd_fixsmall(e):
+    """Owner-only repair for the poisoned-archive era: dead CDN
+    links (esp. the API's expiring 720p ones) used to be archived
+    as ~3 KB 'videos' — error pages wired into DB channels and
+    episode cards. Find every registry entry whose file is
+    impossibly small, delete those broken messages and unregister
+    them, so the watcher re-downloads the episodes through the now
+    validated path. Dry run by default — /fixsmall go executes."""
+    if not is_owner(e.sender_id):
+        return await flood_respond(e, "👑 <b>Owner only.</b>")
+    import base64 as _b64
+    import autodl
+    go = (e.pattern_match.group(1) or "") == "go"
+    docs = await store.find("downloaded", {})
+    small = [d for d in docs
+             if 0 < int(d.get("size") or 0) < autodl.MIN_VIDEO_BYTES]
+    if not small:
+        return await flood_respond(
+            e, "✅ <b>No broken entries</b> — every archived file in "
+               "the registry is a plausible video size.",
+            parse_mode="html")
+    lines = [f"🩺 <b>Found {len(small)} broken archive "
+             f"entry/entries</b> (archived file < "
+             f"{autodl.MIN_VIDEO_BYTES // 1024} KB — a dead CDN link "
+             f"got archived as a video):"]
+    for d in small[:15]:
+        lines.append(
+            f"· {escape_html(str(d.get('title') or '?'))} Eps "
+            f"{escape_html(str(d.get('episode') or '?'))} "
+            f"[{escape_html(str(d.get('quality') or '?'))}] — "
+            f"{int(d.get('size') or 0)} B")
+    if len(small) > 15:
+        lines.append(f"… and {len(small) - 15} more")
+    if not go:
+        lines.append("\nSend <b>/fixsmall go</b> to delete these "
+                     "broken files from the DB channel(s), "
+                     "unregister them and let the watcher "
+                     "re-download the episodes cleanly.")
+        return await flood_respond(e, "\n".join(lines),
+                                   parse_mode="html")
+    fixed = 0
+    for d in small:
+        for r in [d.get("db") or {}] + list(d.get("db_extra") or []):
+            try:
+                if r.get("channel") and r.get("msg_id"):
+                    await app.delete_messages(int(r["channel"]),
+                                              [int(r["msg_id"])])
+            except Exception:
+                pass
+        try:  # the deep-link row that served this broken file
+            deep = d.get("deep_link") or ""
+            if "start=" in deep:
+                payload = deep.split("start=")[-1]
+                pad = payload + "=" * (-len(payload) % 4)
+                txt = _b64.b64decode(pad.encode()).decode()
+                if txt.startswith("get-"):
+                    await store.col("deeplinks").delete_one(
+                        {"_id": txt[4:]})
+        except Exception:
+            pass
+        try:
+            await store.col("downloaded").delete_one({"_id": d["_id"]})
+            autodl._registered.pop(d["_id"], None)
+            fixed += 1
+        except Exception:
+            pass
+    await flood_respond(
+        e, f"♻️ <b>Repaired {fixed}/{len(small)}</b> — broken files "
+           f"deleted from the DB channel(s) and unregistered. The "
+           f"watcher (or /checknew) re-downloads those episodes "
+           f"through the validated path and posts fresh cards; the "
+           f"OLD cards' buttons stay dead until the new cards land.",
+        parse_mode="html")
+
+
+# pgrep/pkill need procps — minimal VPS images do NOT have it, and
+# when they lack it every check here reads "no process": the
+# watchdog then starts a SECOND worker whose boot sweep DELETES the
+# first one's in-progress download (the "720p file silently removed"
+# mystery). These scans work on any Linux: a pure /proc argv walk —
+# argv[0] must contain python AND an exact argv element must be
+# [path/]vps_worker.py, so neither the SSH wrapper shell (bash -c
+# '… vps_worker.py …') nor the scan itself can ever self-match.
+_PS_SCAN = ("for d in /proc/[0-9]*; do "
+            "a=$(tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null); "
+            "[ -z \"$a\" ] && continue; "
+            "case \"$(echo \"$a\" | head -1)\" in *python*) "
+            "echo \"$a\" | grep -qx -e vps_worker.py "
+            "-e '.*/vps_worker.py' && echo \"${d#/proc/}\";; "
+            "esac; done")
+_KILL_SCAN = ("for d in /proc/[0-9]*; do "
+              "a=$(tr '\\0' '\\n' < \"$d/cmdline\" 2>/dev/null); "
+              "[ -z \"$a\" ] && continue; "
+              "case \"$(echo \"$a\" | head -1)\" in *python*) "
+              "echo \"$a\" | grep -qx -e vps_worker.py "
+              "-e '.*/vps_worker.py' && kill \"${d#/proc/}\" "
+              "2>/dev/null;; esac; done")
+
+
 def _worker_build() -> str:
     """Content-hash of the vps_worker.py sitting next to this file
     (the one /vps redeploy + the watchdog ship to the VPS). The
@@ -770,8 +872,8 @@ async def _worker_autoupdate(st):
     import autodl
     try:
         home = await _push_worker(st)
-        await ssh_exec(ssh, "pkill -f '[v]ps_worker.py' || true; "
-                            "sleep 1", 30)
+        await ssh_exec(ssh, "pkill -f '[v]ps_worker.py' 2>/dev/null; "
+                            + _KILL_SCAN + "; sleep 1", 30)
         rc, out, _ = await ssh_exec(
             ssh, f"cd {home}/{VPS_DIR} && rm -f worker.pid; nohup "
                  f"python3 -u vps_worker.py >> worker.log 2>&1 "
@@ -875,9 +977,10 @@ async def vps_watchdog_loop():
             # 🖥 picks need a live worker — and push the CURRENT
             # file first, so it comes back on the newest build in
             # one shot instead of the stale one it died on
-            rc, out, _ = await ssh_exec(st["ssh"],
-                                        "pgrep -f '[v]ps_worker.py' "
-                                        "|| true", 40)
+            rc, out, _ = await ssh_exec(
+                st["ssh"],
+                "pgrep -f '[v]ps_worker.py' 2>/dev/null; " + _PS_SCAN,
+                40)
             if out.strip():
                 continue   # process alive but silent — network side
             await _push_worker(st)
@@ -916,7 +1019,9 @@ async def cmd_removevps(e):
     v = dict(await store.get_config("vps") or {})
     if v.get("ssh"):
         try:
-            await ssh_exec(v["ssh"], "pkill -f '[v]ps_worker.py'; "
+            await ssh_exec(v["ssh"],
+                           "pkill -f '[v]ps_worker.py' 2>/dev/null; "
+                           + _KILL_SCAN + "; "
                            "crontab -l 2>/dev/null | grep -v "
                            "'[v]ps_worker.py' | crontab -", 60)
         except Exception as exc:
