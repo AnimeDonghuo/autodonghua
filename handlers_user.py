@@ -367,7 +367,7 @@ KNOWN_COMMANDS = {
     "adddbchannel", "dbchannels", "deldbchannel", "settag",
     "status", "addmongo", "cancel",
     "addvps", "vps", "removevps", "searchad", "syncbutton", "setowner",
-    "cancelall",
+    "cancelall", "parallel",
 }
 
 

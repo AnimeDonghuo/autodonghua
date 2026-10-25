@@ -62,6 +62,7 @@ COMMAND_MENU = [
     ("vps", "VPS mode on/off + worker status"),
     ("removevps", "Remove the VPS worker"),
     ("cancelall", "Stop ALL running & queued download jobs"),
+    ("parallel", "Run Koyeb + VPS download lanes at once"),
 ]
 
 
@@ -665,6 +666,7 @@ async def cmd_vps(e):
         v["enabled"] = (arg == "on")
         await store.set_config("vps", v)
     st = await vps_state()
+    par = bool(await store.get_config("parallel", False))
     beat = time.time() - (st.get("beat") or 0)
     caps = st.get("caps") or {}
     yes = lambda k: "✓" if caps.get(k) else "✗"
@@ -676,6 +678,8 @@ async def cmd_vps(e):
            "Koyeb handles everything, no VPS"),
         f"Worker: <b>{'online' if st.get('online') else 'OFFLINE'}</b>"
         + (f" (beat {int(beat)}s ago)" if st.get("beat") else ""),
+        f"Parallel: <b>{'ON 🔀' if par else 'off'}</b> — /parallel "
+        f"runs Koyeb + VPS at the same time",
         f"Caps: py {caps.get('py', '?')} · telethon {yes('telethon')} "
         f"· Pillow {yes('PIL')} · hachoir {yes('hachoir')} · disk "
         f"{caps.get('disk_mb', '?')} MB",

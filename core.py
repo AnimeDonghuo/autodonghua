@@ -62,11 +62,13 @@ async def vps_beat(secret, caps=None):
 
 async def vps_claim(secret):
     v = dict(await store.get_config("vps") or {})
-    if not v.get("enabled") or not v.get("secret") \
-            or secret != v.get("secret"):
+    if not v.get("secret") or secret != v.get("secret"):
         return None
     docs = await store.find("vps_jobs", {"status": "pending"},
-                            limit=1, sort=[("ts", 1)])
+                            limit=20, sort=[("ts", 1)])
+    if not v.get("enabled"):
+        # mode OFF: only per-batch VPS picks (force) may run
+        docs = [d for d in docs if d.get("force")]
     if not docs:
         return None
     d = dict(docs[0])

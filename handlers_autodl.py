@@ -8,7 +8,8 @@ from telethon import events
 from telethon.tl.custom import Button
 
 import autodl
-from core import app, is_owner, require_staff, store, flood_respond, flood_edit
+from core import (app, is_owner, require_staff, store, flood_respond,
+                  flood_edit, vps_state)
 from handlers_files import serve_file
 from handlers_user import forcesub_gate
 from style import escape_html
@@ -105,6 +106,7 @@ async def cmd_autodl(e):
 # /checknew — tap-to-select menu, then the queue runs the chosen ones
 # ---------------------------------------------------------------------- #
 SEL = {}  # message id -> {"fresh": [...], "chosen": set(), "by": uid}
+SEL_EXEC = {}  # message id -> picked list awaiting the Koyeb/VPS choice
 
 
 def _sel_label(idx, item, chosen):
@@ -211,15 +213,42 @@ async def cb_sel_done(e):
                               alert=True)
     picked = [st["fresh"][i] for i in sorted(st["chosen"])]
     n_files = sum(len(t) for _, t, _ in picked)
-    await flood_edit(e, 
-        f"⏳ <b>Queue started</b> — {len(picked)} episode(s), "
-        f"{n_files} file(s), one by one.\n\n"
+    vst = await vps_state()
+    if vst.get("secret") and vst.get("ssh"):
+        # a VPS is registered → the owner picks the executor first
+        if len(SEL_EXEC) > 32:
+            SEL_EXEC.pop(next(iter(SEL_EXEC)), None)
+        SEL_EXEC[e.message_id] = picked
+        await flood_edit(e,
+            f"⏳ <b>Queue ready</b> — {len(picked)} episode(s), "
+            f"{n_files} file(s).\n\n"
+            f"🛰 <b>Run it on…</b>\n"
+            f"☁️ <b>Koyeb</b> — this server downloads+uploads\n"
+            f"🖥 <b>VPS</b> — your worker downloads+uploads "
+            + ("(online ✅)" if vst.get("online") else
+               "(OFFLINE ⚠️ — falls back to Koyeb per file)"),
+            parse_mode="html",
+            buttons=[[Button.inline("☁️ Koyeb", b"selexec:koyeb"),
+                      Button.inline("🖥 VPS", b"selexec:vps")]])
+        return
+    await _start_picked(e, picked, "auto")
+
+
+async def _start_picked(e, picked, executor="auto"):
+    """Kick the selected batch and report when it finishes."""
+    n_files = sum(len(t) for _, t, _ in picked)
+    where = {"koyeb": "☁️ Koyeb", "vps": "🖥 VPS worker",
+             "auto": "auto (VPS if online, else Koyeb)"}[executor]
+    await flood_edit(e,
+        f"⏳ <b>Queue started on {where}</b> — {len(picked)} "
+        f"episode(s), {n_files} file(s), one by one.\n\n"
         f"📩 Live progress panel is in the owner's DM.",
         parse_mode="html", buttons=None)
 
     async def _run():
         try:
-            done = await autodl.start_batch(picked)
+            done = await autodl.start_batch(picked,
+                                            executor=executor)
             try:
                 hint = ("" if done >= len(picked) else
                         "\n\n⚠️ Some episodes were skipped — usually "
@@ -243,6 +272,44 @@ async def cb_sel_done(e):
             except Exception:
                 pass
     asyncio.ensure_future(_run())
+
+
+@app.on(events.CallbackQuery(pattern=rb"selexec:(\w+)"))
+async def cb_sel_exec(e):
+    """Executor choice for a ready queue: ☁️ Koyeb or 🖥 VPS."""
+    picked = SEL_EXEC.pop(e.message_id, None)
+    if picked is None:
+        return await e.answer("Menu expired — run /checknew again",
+                              alert=True)
+    await e.answer()
+    await _start_picked(e, picked, e.pattern_match.group(1).decode())
+
+
+@app.on(events.NewMessage(pattern=r"^/parallel(?: (on|off))?$"))
+async def cmd_parallel(e):
+    """Owner-only: run one file on Koyeb AND one on the VPS at the
+    same time during batches."""
+    if not is_owner(e.sender_id):
+        return await flood_respond(e, "👑 Owner only.")
+    sub = (e.pattern_match.group(1) or "").lower()
+    cur = bool(await store.get_config("parallel", False))
+    if sub:
+        cur = (sub == "on")
+        await store.set_config("parallel", cur)
+    st = await vps_state()
+    if cur:
+        body = ("Batches run TWO files at once — one on ☁️ Koyeb, "
+                "one on 🖥 your VPS (two different bots = two "
+                "upload lanes).\nWorker right now: "
+                + ("online ✅" if st.get("online") else
+                   "OFFLINE — parallel falls back to one-by-one "
+                   "until it beats again."))
+    else:
+        body = ("Normal mode: one file at a time (VPS when the mode "
+                "is ON and the worker is online, else Koyeb).")
+    await flood_respond(e, f"🔀 <b>Parallel mode: "
+                           f"{'ON' if cur else 'OFF'}</b>\n\n{body}",
+                        parse_mode="html")
 
 
 @app.on(events.NewMessage(pattern=r"^/status$"))

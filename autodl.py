@@ -255,7 +255,8 @@ class JobCancelled(Exception):
 
 # The live job queue: one job runs at a time, the rest stay queued.
 JOBS = {}          # job id -> job dict
-CURRENT = None     # the running job
+CURRENT = None     # the running job (lane 1)
+CURRENT2 = None    # lane 2 — only used while /parallel is on
 BATCH = {"n": 0, "total": 0, "stop": False}
 
 
@@ -277,7 +278,8 @@ def _new_job(series, ep, quality, url):
     job = {"id": jid, "title": series, "ep": ep, "quality": quality,
            "url": url, "phase": "download", "status": "running",
            "done": 0, "total": 0, "up_done": 0, "up_total": 0,
-           "speed": 0.0, "cancel": False, "error": ""}
+           "speed": 0.0, "cancel": False, "error": "",
+           "via": "Koyeb"}
     JOBS[jid] = job
     return job
 
@@ -371,6 +373,10 @@ def job_panel(job=None) -> str:
                      f"Eps {job['ep']} [{job['quality']}]")
         lines.append(f"📋 Video {BATCH['n']}/{BATCH['total']} "
                      f"· {state}")
+        lines.append("🛰 Running on: "
+                     + ("<b>🖥 VPS worker</b>"
+                        if job.get("via") == "VPS"
+                        else "<b>☁️ Koyeb</b>"))
         lines.append("")
         if job["phase"] == "upload":
             pct = (job["up_done"] / job["up_total"] * 100
@@ -395,6 +401,20 @@ def job_panel(job=None) -> str:
                          f"· ⏳ ETA {eta}s")
         lines.append("")
         lines.append(f"🆔 {job['id']} · /cancel_{job['id']}")
+    j2 = CURRENT2 if job is not CURRENT2 else None
+    if j2 is not None:
+        pct2 = ((j2["up_done"] / j2["up_total"] * 100)
+                if j2["phase"] == "upload" and j2["up_total"] else
+                ((j2["done"] / j2["total"] * 100)
+                 if j2["total"] else 0.0))
+        arrow = "⬆" if j2["phase"] == "upload" else "⬇"
+        lines.append("")
+        lines.append(f"🎬 2nd lane: {escape_html(j2['title'])} "
+                     f"Eps {j2['ep']} [{j2['quality']}]")
+        lines.append(f"{arrow} {_bar(pct2)} {pct2:.0f}% · 🛰 "
+                     + ("🖥 VPS" if j2.get("via") == "VPS"
+                        else "☁️ Koyeb")
+                     + f" · /cancel_{j2['id']}")
     lines.append("")
     lines.append(f"📊 Container CPU: {cpu:.0f}% of quota · "
                  f"RAM: {ram:.1f} MiB / {total:.1f} MiB")
@@ -852,7 +872,8 @@ def _free_up(need_mb=900):
 VPS_JOB_TIMEOUT = 20 * 60
 
 
-async def _vps_archive(job, series, ep, q, url, db0, poster):
+async def _vps_archive(job, series, ep, q, url, db0, poster,
+                       force=False):
     """Hand download+upload to the VPS worker. Returns the archive
     Message in db0, or None so run_job falls back to Koyeb."""
     import base64 as _b64
@@ -861,7 +882,8 @@ async def _vps_archive(job, series, ep, q, url, db0, poster):
            "url": url, "channel": int(db0), "series": series,
            "ep": ep, "quality": q,
            "caption": f"{series} — Ep {ep} [{q}]",
-           "filename": f"{series} Eps {int(ep):02d} [{q}].mp4"}
+           "filename": f"{series} Eps {int(ep):02d} [{q}].mp4",
+           "force": bool(force)}
     if poster:
         doc["thumb_b64"] = _b64.b64encode(
             core_mod.thumb_16x9(poster) or b"").decode()
@@ -880,9 +902,14 @@ async def _vps_archive(job, series, ep, q, url, db0, poster):
         prog = d.get("prog") or {}
         if prog and (time.time() - prog.get("ts", 0)) < 30:
             # live VPS progress into the normal job/panel fields
-            job["phase"] = prog.get("phase") or job["phase"]
-            job["done"] = prog.get("done") or 0
-            job["total"] = prog.get("total") or 0
+            ph = prog.get("phase") or job["phase"]
+            job["phase"] = ph
+            if ph == "upload":
+                job["up_done"] = prog.get("done") or 0
+                job["up_total"] = prog.get("total") or 0
+            else:
+                job["done"] = prog.get("done") or 0
+                job["total"] = prog.get("total") or 0
             job["speed"] = prog.get("speed") or 0
             job["via"] = "VPS"
         st = d.get("status")
@@ -910,16 +937,22 @@ async def _vps_archive(job, series, ep, q, url, db0, poster):
     return None
 
 
-async def run_job(group, item, ep, stream, db_ids, poster):
+async def run_job(group, item, ep, stream, db_ids, poster,
+                  executor="auto"):
     """One queued file: download (with live progress + cancel),
-    archive in every DB channel (with upload progress), register."""
-    global CURRENT
+    archive in every DB channel (with upload progress), register.
+    executor: 'auto' (VPS when mode ON + online, else Koyeb),
+    'koyeb' (never VPS) or 'vps' (force VPS when online)."""
+    global CURRENT, CURRENT2
     series = group["series"]
     norm = group["norm"]
     q = stream["quality"]
     from telethon.errors import FloodWaitError
     job = _new_job(series, ep, q, stream["url"])
-    CURRENT = job
+    if CURRENT is None:
+        CURRENT = job
+    else:
+        CURRENT2 = job   # /parallel: second lane
     BATCH["n"] += 1
     print(f"[autodl] job {BATCH['n']}/{BATCH['total']} start: "
           f"{series} Ep {ep} [{q}]")
@@ -927,11 +960,14 @@ async def run_job(group, item, ep, stream, db_ids, poster):
     path = os.path.join(DOWNLOAD_DIR, fname)
     try:
         vps_sent = None
-        vps = await core_mod.vps_state()
-        if vps.get("enabled") and vps.get("online"):
-            vps_sent = await _vps_archive(job, series, ep, q,
-                                          stream["url"], db_ids[0],
-                                          poster)
+        if executor != "koyeb":
+            vps = await core_mod.vps_state()
+            if vps.get("online") and (executor == "vps"
+                                      or vps.get("enabled")):
+                vps_sent = await _vps_archive(
+                    job, series, ep, q, stream["url"], db_ids[0],
+                    poster, force=(executor == "vps"))
+        job["via"] = "VPS" if vps_sent is not None else "Koyeb"
         if vps_sent is None:
             if job.get("cancel"):
                 raise JobCancelled()
@@ -979,6 +1015,7 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                                         vps_sent.id),
                 "doc": _doc_ref(vps_sent.document
                                 or vps_sent.video)})
+        last_exc = None
         for dbc in (db_ids[1:] if vps_sent else db_ids):
             if job.get("cancel"):
                 raise JobCancelled()
@@ -1002,11 +1039,13 @@ async def run_job(group, item, ep, stream, db_ids, poster):
                             dbc, file=primary.media, caption=cap)
                     break
                 except FloodWaitError as fw:
+                    last_exc = f"FloodWait {fw.seconds}s"
                     core_mod.flood_mark(int(dbc), fw.seconds)
                     print(f"[autodl] archive floodwait {fw.seconds}s "
                           f"to {dbc} — sleeping it out")
                     await asyncio.sleep(min(fw.seconds, 900) + 5)
                 except Exception as exc:
+                    last_exc = repr(exc)[:160]
                     print(f"[autodl] archive try {attempt} failed to "
                           f"{dbc}: {exc}")
                     await asyncio.sleep(8)
@@ -1028,7 +1067,9 @@ async def run_job(group, item, ep, stream, db_ids, poster):
         if not refs:
             job["status"] = "failed"
             job["error"] = (f"archive failed to all {len(db_ids)} "
-                            f"DB channel(s)")
+                            f"DB channel(s)"
+                            + (f" — last error: {last_exc}"
+                               if last_exc else ""))
             return job
         link = refs[0]["link"]
         primary, extra = refs[0], refs[1:]
@@ -1051,7 +1092,10 @@ async def run_job(group, item, ep, stream, db_ids, poster):
             os.remove(path)
         except Exception:
             pass
-        CURRENT = None
+        if CURRENT2 is job:
+            CURRENT2 = None
+        elif CURRENT is job:
+            CURRENT = None
     return job
 
 
@@ -1086,14 +1130,15 @@ async def serve_deeplink(e, payload: str) -> bool:
     return True
 
 
-async def start_batch(fresh, force=False):
+async def start_batch(fresh, force=False, executor="auto"):
     """Run one batch under the global lock (watcher, /checknew,
-    /searchad). force=True re-downloads even archived qualities."""
+    /searchad). force=True re-downloads even archived qualities.
+    executor: auto | koyeb | vps (per-batch pick)."""
     async with LOAD:
-        return await run_batch(fresh, force=force)
+        return await run_batch(fresh, force=force, executor=executor)
 
 
-async def run_batch(fresh, force=False):
+async def run_batch(fresh, force=False, executor="auto"):
     """Process every fresh episode through the job queue, with a
     live progress panel DM'd to the owner."""
     groups = group_fresh(fresh)
@@ -1120,7 +1165,8 @@ async def run_batch(fresh, force=False):
             if BATCH.get("stop"):
                 print("[autodl] cancel-all — batch stopped")
                 break
-            if await process_group(g, force=force):
+            if await process_group(g, force=force,
+                                   executor=executor):
                 done += 1
     finally:
         ok = sum(1 for j in JOBS.values() if j["status"] == "done")
@@ -1695,7 +1741,71 @@ async def backlog_cards(channel_id=None, gap=25):
     return made
 
 
-async def process_group(group, force=False) -> bool:
+async def _parallel_on() -> bool:
+    """/parallel toggle: batches may run one file on Koyeb AND one on
+    the VPS at the same time (two different bots = two upload
+    lanes). Only meaningful while the worker is online."""
+    try:
+        return bool(await store.get_config("parallel", False))
+    except Exception:
+        return False
+
+
+async def _run_stream(group, item, ep, stream, db_ids, poster,
+                      executor="auto"):
+    """One file of a group: run_job with one retry, honest failure
+    reporting and lane cleanup. Returns True when it archived."""
+    global CURRENT, CURRENT2
+    series = group["series"]
+    # one stalled file must never kill the whole batch or
+    # hold the global lock forever
+    err = None
+    job = None
+    for attempt in (1, 2):  # one retry before giving up
+        err = None
+        job = None
+        try:
+            job = await asyncio.wait_for(
+                run_job(group, item, ep, stream, db_ids, poster,
+                        executor=executor),
+                timeout=5400)
+        except asyncio.TimeoutError:
+            err = "timeout (90 min)"
+        except Exception as exc:
+            err = repr(exc)[:160]
+        # a job can also fail QUIETLY (disk low / archive
+        # error inside run_job) — never let that stay silent
+        if err is None and job is not None \
+                and job.get("status") == "failed":
+            err = job.get("error") or "failed"
+        if err is None:
+            break
+        print(f"[autodl] job attempt {attempt} failed "
+              f"({err}): {series} Ep {ep} "
+              f"{stream['quality']}")
+        tgt = job if job is not None else (CURRENT or CURRENT2)
+        if tgt is not None and tgt.get("status") == "running":
+            tgt["status"] = "failed"
+            tgt["error"] = err or "failed"
+        if CURRENT is tgt:
+            CURRENT = None
+        if CURRENT2 is tgt:
+            CURRENT2 = None
+        _free_up(900)
+        if err == "disk low" or err.startswith("archive"):
+            break  # re-downloading cannot fix disk/channel
+        await asyncio.sleep(3)
+    if err:  # never silent: tell the owner
+        print("[autodl] job FAILED:", series, "Ep", ep,
+              stream["quality"], err)
+        asyncio.ensure_future(_owner_dm(
+            f"❌ <b>Job failed</b> — {series} Ep {ep} "
+            f"[{stream['quality']}]: {err}"))
+    await asyncio.sleep(2)  # smooth the batch send rate
+    return err is None
+
+
+async def process_group(group, force=False, executor="auto") -> bool:
     """Download every missing quality of every new episode (one by
     one), archive in the DB channel, then ONE designed poster post
     per series with quality buttons covering the episode range."""
@@ -1723,52 +1833,42 @@ async def process_group(group, force=False) -> bool:
             print("[autodl] cancel-all — group ends early")
             break
         _, ep = parse_api_title(item.get("title", ""))
+        pend = []
         for stream in todo:
-            if BATCH.get("stop"):
-                break
             if not force and await registry_get(
                     norm, ep, stream["quality"]):
                 continue  # another batch already archived this file
-            # one stalled file must never kill the whole batch or
-            # hold the global lock forever
-            err = None
-            for attempt in (1, 2):  # one retry before giving up
-                err = None
-                job = None
-                try:
-                    job = await asyncio.wait_for(
-                        run_job(group, item, ep, stream, db_ids,
-                                poster),
-                        timeout=5400)
-                except asyncio.TimeoutError:
-                    err = "timeout (90 min)"
-                except Exception as exc:
-                    err = repr(exc)[:160]
-                # a job can also fail QUIETLY (disk low / archive
-                # error inside run_job) — never let that stay silent
-                if err is None and job is not None \
-                        and job.get("status") == "failed":
-                    err = job.get("error") or "failed"
-                if err is None:
+            pend.append(stream)
+        par = False
+        if pend and await _parallel_on():
+            _st = await core_mod.vps_state()
+            par = bool(_st.get("online"))
+        if par:
+            # 🔀 two lanes at once: even files on Koyeb, odd on the
+            # VPS — different bots, so separate Telegram rate limits
+            lane_k = pend[0::2]
+            lane_v = pend[1::2]
+            idx = 0
+            while idx < max(len(lane_k), len(lane_v)):
+                if BATCH.get("stop"):
                     break
-                print(f"[autodl] job attempt {attempt} failed "
-                      f"({err}): {series} Ep {ep} "
-                      f"{stream['quality']}")
-                if CURRENT is not None:
-                    CURRENT["status"] = "failed"
-                    CURRENT["error"] = err or "failed"
-                CURRENT = None
-                _free_up(900)
-                if err == "disk low" or err.startswith("archive"):
-                    break  # re-downloading cannot fix disk/channel
-                await asyncio.sleep(3)
-            if err:  # never silent: tell the owner
-                print("[autodl] job FAILED:", series, "Ep", ep,
-                      stream["quality"], err)
-                asyncio.ensure_future(_owner_dm(
-                    f"❌ <b>Job failed</b> — {series} Ep {ep} "
-                    f"[{stream['quality']}]: {err}"))
-            await asyncio.sleep(2)  # smooth the batch send rate
+                tasks = []
+                if idx < len(lane_k):
+                    tasks.append(_run_stream(group, item, ep,
+                                             lane_k[idx], db_ids,
+                                             poster, "koyeb"))
+                if idx < len(lane_v):
+                    tasks.append(_run_stream(group, item, ep,
+                                             lane_v[idx], db_ids,
+                                             poster, "vps"))
+                await asyncio.gather(*tasks)
+                idx += 1
+        else:
+            for stream in pend:
+                if BATCH.get("stop"):
+                    break
+                await _run_stream(group, item, ep, stream, db_ids,
+                                  poster, executor)
 
         links = {}
         deeps = {}
