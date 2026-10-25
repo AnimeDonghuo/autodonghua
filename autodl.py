@@ -41,7 +41,7 @@ from sources import build_metadata
 from style import escape_html, post_caption
 
 API_ROOT = "https://api.parciv.workers.dev"
-BUILD = "2026-10-25-c"  # stamp shown in /status — proves deploy freshness
+BUILD = "2026-10-25-d"  # stamp shown in /status — proves deploy freshness
 DEFAULT_SECTIONS = ["donghua", "anime"]
 DEFAULT_QUALITIES = ["720p", "1080p"]
 KEEP_SEEN = 300
@@ -432,6 +432,17 @@ def _job_card(job):
     """The progress body (bar + ⬆/⬇ + phase line) — rendered
     IDENTICALLY for both parallel lanes."""
     lines = []
+    if job["phase"] in ("vps-queue", "vps-wait"):
+        # handed to the VPS worker, no mirrored progress yet — never
+        # render this window as a stalled 0% Koyeb download
+        lines.append(f"{_bar(0)}  0.0%")
+        lines.append("📌 " + ("Waiting for the 🖥 worker to come back "
+                              "online — a minute at most, then this "
+                              "file runs on it…"
+                              if job["phase"] == "vps-wait" else
+                              "Handed to your 🖥 VPS worker — it picks "
+                              "this up within seconds…"))
+        return lines
     if job["phase"] == "upload":
         pct = (job["up_done"] / job["up_total"] * 100
                if job["up_total"] else 0.0)
@@ -484,6 +495,10 @@ def job_panel(job=None) -> str:
                      + ("<b>🖥 VPS worker</b>"
                         if job.get("via") == "VPS"
                         else "<b>☁️ Koyeb</b>"))
+        if job.get("fb") and job.get("via") != "VPS":
+            lines.append(f"⚠️ 🖥 VPS couldn't take this file "
+                         f"({escape_html(str(job['fb']))}) — ☁️ Koyeb "
+                         f"is doing it instead")
         lines.append("")
         lines += _job_card(job)
         lines.append("")
@@ -1038,11 +1053,13 @@ async def _vps_archive(job, series, ep, q, url, db0, poster,
         d = await store.find("vps_jobs", {"_id": jid})
         d = d[0] if d else None
         if not d:
+            job["fb"] = "job doc vanished"
             return None
         prog = d.get("prog") or {}
         if prog and (time.time() - prog.get("ts", 0)) < 30:
             # live VPS progress into the normal job/panel fields
-            ph = prog.get("phase") or job["phase"]
+            job.pop("fb", None)   # the worker IS on it now — any
+            ph = prog.get("phase") or job["phase"]   # reason is moot
             job["phase"] = ph
             if ph == "upload":
                 job["up_done"] = prog.get("done") or 0
@@ -1065,14 +1082,19 @@ async def _vps_archive(job, series, ep, q, url, db0, poster,
                 return sent
             print(f"[autodl] VPS done but message missing "
                   f"({db0}/{msg_id}) — falling back")
+            job["fb"] = "archived but message fetch failed"
             return None
         if st == "failed":
             print("[autodl] VPS job failed:",
                   str(d.get("error"))[:140])
+            job["fb"] = ("worker failed: "
+                         + str(d.get("error") or "unknown")[:80])
             await store.col("vps_jobs").delete_one({"_id": jid})
             return None
         await asyncio.sleep(3)
     await store.col("vps_jobs").delete_one({"_id": jid})
+    if not job.get("cancel"):
+        job["fb"] = "worker didn't finish in 20 min"
     print("[autodl] VPS job timed out / cancelled — Koyeb takes over")
     return None
 
@@ -1106,8 +1128,33 @@ async def run_job(group, item, ep, stream, db_ids, poster,
         vps_sent = None
         if executor != "koyeb":
             vps = await core_mod.vps_state()
-            if vps.get("online") and (executor == "vps"
-                                      or vps.get("enabled")):
+            wants_vps = executor == "vps" or vps.get("enabled")
+            if wants_vps and vps.get("secret") \
+                    and not vps.get("online") \
+                    and (time.time() - (vps.get("beat") or 0)) < 900:
+                # TRANSIENT offline — a Koyeb redeploy gap (beats
+                # can't land while the bot restarts), a beat hiccup,
+                # or an old worker that can't beat mid-job. The
+                # watchdog revives dead workers and beats land within
+                # ~90 s, so wait a little instead of handing the file
+                # to Koyeb while the user's VPS is right there. A
+                # LONG-dead worker (beat >15 min old) skips the wait
+                # and falls back immediately.
+                job["via"] = "VPS"
+                job["phase"] = "vps-wait"
+                for _ in range(9):
+                    await asyncio.sleep(10)
+                    if job.get("cancel"):
+                        break
+                    vps = await core_mod.vps_state()
+                    if vps.get("online"):
+                        break
+                job["phase"] = "download"
+            if vps.get("online") and wants_vps:
+                # panel must NEVER show a VPS-bound file as a stalled
+                # Koyeb download during the queue/claim/login window
+                job["via"] = "VPS"
+                job["phase"] = "vps-queue"
                 vps_sent = await _vps_archive(
                     job, series, ep, q, stream["url"], db_ids[0],
                     poster, force=(executor == "vps"))
@@ -1122,8 +1169,14 @@ async def run_job(group, item, ep, stream, db_ids, poster,
                         vps_sent = await _vps_archive(
                             job, series, ep, q, fresh, db_ids[0],
                             poster, force=(executor == "vps"))
+            elif wants_vps and vps.get("secret") \
+                    and not job.get("cancel"):
+                job["fb"] = "worker offline"
         job["via"] = "VPS" if vps_sent is not None else "Koyeb"
+        if vps_sent is not None:
+            job.pop("fb", None)
         if vps_sent is None:
+            job["phase"] = "download"   # out of the vps-queue/wait card
             if job.get("cancel"):
                 raise JobCancelled()
             if LOAD not in st.get("locks", ()):

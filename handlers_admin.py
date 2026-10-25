@@ -693,8 +693,16 @@ async def cmd_vps(e):
         f"@{escape_html((st.get('ssh') or {}).get('host', '-'))}</code>",
     ]
     if st.get("enabled") and not st.get("online"):
-        lines.append("⚠️ ON but worker offline — jobs automatically "
-                     "fall back to Koyeb.")
+        lines.append("⚠️ ON but worker offline — jobs wait up to 90s "
+                     "for the worker, then fall back to Koyeb; the "
+                     "watchdog revives it automatically.")
+    if st.get("online") and \
+            str(caps.get("build") or "") != _worker_build():
+        lines.append("🔄 <b>Worker update pending</b> — build "
+                     f"<code>{escape_html(str(caps.get('build') or '?'))}"
+                     f"</code> → <code>{_worker_build()}</code> ships "
+                     "itself over SSH within ~5 min (as soon as the "
+                     "worker is idle). Nothing to do.")
     await flood_respond(e, "\n".join(lines), parse_mode="html")
 
 
@@ -747,10 +755,17 @@ async def _worker_autoupdate(st):
         inflight = []
     now = time.time()
     for d in inflight or []:
-        if d.get("status") == "running" or \
-                ((d.get("prog") or {}).get("ts") or 0) > now - 120:
+        prog_ts = (d.get("prog") or {}).get("ts") or 0
+        started = d.get("started") or d.get("ts") or 0
+        if prog_ts > now - 120 or \
+                (d.get("status") == "running" and started > now - 240):
+            # REAL mid-job: progress flowing, or freshly claimed
+            # (the worker's login gap before its first progress post)
             print("[vps] worker is mid-job — auto-update waits a tick")
             return
+        # anything else is a ZOMBIE (old 'running' doc whose poller
+        # died in a redeploy/crash) — deferring on those froze a VPS
+        # on an ancient build FOREVER, so they no longer block
     ssh = st["ssh"]
     import autodl
     try:
@@ -836,6 +851,20 @@ async def vps_watchdog_loop():
             st = await vps_state()
             if not st.get("ssh"):
                 continue
+            # purge ZOMBIE job docs: a live poller deletes its doc at
+            # the 20-min VPS_JOB_TIMEOUT at the latest, so anything
+            # older was orphaned by a redeploy/crash — and a leftover
+            # 'running' doc used to defer the worker auto-update
+            # forever (how a VPS froze on an ancient build)
+            try:
+                zq = {"ts": {"$lt": time.time() - 25 * 60}}
+                for zd in await store.find("vps_jobs", zq) or []:
+                    await store.col("vps_jobs").delete_one(
+                        {"_id": zd["_id"]})
+                    print("[vps] purged zombie job doc",
+                          zd.get("_id"), zd.get("status"))
+            except Exception as exc:
+                print("[vps] zombie purge skipped:", repr(exc)[:120])
             if st.get("online"):
                 await _disk_low_warn(st)
                 # outdated worker? refresh it even while the mode is
